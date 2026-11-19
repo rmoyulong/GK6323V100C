@@ -832,13 +832,13 @@ jobs:
         env:
           PATCHES_KERNEL_VERSION: ${{ env.PATCHES_KERNEL_VERSION }}
           PATCHES_BASE_SHA: ${{ env.PATCHES_BASE_SHA }}
-          TARGET_DTS: ${{ env.TARGET_DTS }}
+          TARGET_DTB: ${{ env.TARGET_DTB }}
           UIMAGE_LOADADDR: ${{ env.UIMAGE_LOADADDR }}
         run: |
           set -euo pipefail
           cd linux_build/out
           KREL="$PATCHES_KERNEL_VERSION"
-          DTB_NAME="${TARGET_DTS}.dtb"
+          DTB_NAME="${TARGET_DTB}"
 
           cat > RELEASE_NOTES.md <<'EOF'
           # GK6323V100C 主线内核 @KREL@
@@ -913,7 +913,7 @@ jobs:
           artifactErrorsFailBuild: true
           files: |
             linux_build/out/boot.img
-            linux_build/out/${{ env.TARGET_DTS }}.dtb
+            linux_build/out/${{ env.TARGET_DTB }}
             linux_build/out/modules.tar.gz
             linux_build/out/Image
             linux_build/out/sha256sums.txt
