@@ -1,0 +1,32 @@
+# 构建产物
+linux_build/
+out/
+histb-patches/
+*.tar.gz
+*.zip
+
+# 设备树编译产物
+*.dtb
+!dts/*.dts
+
+# 内核镜像
+boot.img
+uImage
+Image
+zImage
+zImage-dtb
+Image-dtb
+
+# 配置备份
+.config.old
+.config.bak
+*.orig
+
+# 备份文件
+*~
+*.bak
+*.swp
+.DS_Store
+
+# 日志
+*.log
