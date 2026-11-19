@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="GB2312" ?>
+<Partition_Info ProgrammerFile="">
+<Part Sel="0" PartitionName="fastboot" FlashType="emmc" FileSystem="none" Start="0" Length="1M" SelectFile="fastboot.img"/>
+<Part Sel="1" PartitionName="bootargs" FlashType="emmc" FileSystem="none" Start="1M" Length="512K" SelectFile="bootargs.img"/>
+<Part Sel="1" PartitionName="bootargsbak" FlashType="emmc" FileSystem="none" Start="1536K" Length="512K" SelectFile="bootargs.img"/>
+<Part Sel="0" PartitionName="recovery" FlashType="emmc" FileSystem="none" Start="2M" Length="20M" SelectFile="recovery.img"/>
+<Part Sel="0" PartitionName="deviceinfo" FlashType="emmc" FileSystem="none" Start="22M" Length="2M" SelectFile="deviceinfo.img"/>
+<Part Sel="0" PartitionName="securestore" FlashType="emmc" FileSystem="none" Start="24M" Length="8M" SelectFile="securestore.img"/>
+<Part Sel="0" PartitionName="atf" FlashType="emmc" FileSystem="none" Start="32M" Length="2M" SelectFile="atf.img"/>
+<Part Sel="0" PartitionName="baseparam" FlashType="emmc" FileSystem="none" Start="34M" Length="8M" SelectFile="baseparam.img"/>
+<Part Sel="0" PartitionName="pqparam" FlashType="emmc" FileSystem="none" Start="42M" Length="8M" SelectFile="pqparam.img"/>
+<Part Sel="1" PartitionName="dtbo" FlashType="emmc" FileSystem="none" Start="50M" Length="2M" SelectFile="dtbo.img"/>
+<Part Sel="0" PartitionName="logo" FlashType="emmc" FileSystem="none" Start="52M" Length="10M" SelectFile="logo.img"/>
+<Part Sel="0" PartitionName="logobak" FlashType="emmc" FileSystem="none" Start="62M" Length="10M" SelectFile="logobak.img"/>
+<Part Sel="0" PartitionName="fastplay" FlashType="emmc" FileSystem="none" Start="72M" Length="20M" SelectFile="fastplay.img"/>
+<Part Sel="0" PartitionName="recoverybak" FlashType="emmc" FileSystem="none" Start="92M" Length="20M" SelectFile="recoverybak.img"/>
+<Part Sel="1" PartitionName="boot" FlashType="emmc" FileSystem="none" Start="112M" Length="60M" SelectFile="boot.img"/>
+<Part Sel="0" PartitionName="misc" FlashType="emmc" FileSystem="none" Start="172M" Length="20M" SelectFile="misc.img"/>
+<Part Sel="0" PartitionName="trustedcore" FlashType="emmc" FileSystem="none" Start="192M" Length="20M" SelectFile="trustedcore.img"/>
+<Part Sel="1" PartitionName="rootfs" FlashType="emmc" FileSystem="none" Start="212M" Length="-" SelectFile="rootfs.img"/>
+</Partition_Info>
