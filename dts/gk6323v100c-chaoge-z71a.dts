@@ -2,229 +2,255 @@
 /*
  * 国科微 GK6323V100C（整机型号 ChaoGe Z71A）板级设备树 —— 引导最小集
  *
- * 数据来源：真机原厂内核导出的 /sys/firmware/devicetree/base，逐项对齐。
- * 真机实测：4×Cortex-A55（MIDR 0x412FD050）+ ARM GICv3 + 国科私有 CRU。
+ * 数据来源：真机原厂内核导出的 /sys/firmware/devicetree/base，逐项对齐，
+ * 没有臆造参数。真机实测为 4×Cortex-A55（part 0xd05）+ GICv3 + 国科私有 CRU，
+ * 不是海思的 A53 + GIC-400，所以本文件不是海思 mv200h 板级的照抄。
  *
- * 设备树体积硬约束：
- *   U-Boot bootcmd = mmc read 0 0x03FFC000 0x19000 0x20
- *   即从 dtbo 分区（起始块 0x19000）只读 0x20 = 32 块 = 16 KiB 到 0x03FFC000。
- *   作者那版 dtbo 里的 dtb 是 9156 字节；本文件只保留点亮系统必需节点。
+ * 为什么只有这些节点 —— 引导器读了 16KiB 就收手：
+ *   U-Boot 的 bootcmd 是
+ *     mmc read 0 0x03FFC000 0x19000 0x20
+ *   即从 dtbo 分区（起始块 0x19000）只读 0x20 = 32 块 = 16KiB 到 0x03FFC000，
+ *   这个地址紧贴内核加载地址 0x04000000 之下。设备树超过 16KiB 就会被截断，
+ *   内核解析失败 → 起不来。作者那版 dtbo 里的 dtb 只有 9156 字节。
+ *   所以本文件只保留「点亮系统所必需」的节点，其余一律不写：
+ *     串口控制台(uart0) / eMMC / 复位看门狗 / USB 主控 / 网口 / RTC
+ *
+ * 本次相对上一版删掉的（引导用不到，需要时再加回来）：
+ *   GPIO×8（PL061，无任何消费者）、uart2、uart3、i2c0、i2c1、spi0、
+ *   chosen 下的 simple-framebuffer、vdp 保留内存，
+ *   aliases 中除 serial0 以外的全部别名，以及根 compatible 的第三串。
  *
  * 与真机原树的有意差异（让主线内核能认领硬件）：
- *   1) eMMC 的 compatible 追加 "snps,dw-mshc"，使主线 dw_mmc-pltfm 认领；
- *   2) 各外设时钟改指 fixed-clock，不再引用国科私有 CRU（主线无该驱动）；
- *   3) 主线无驱动的节点（aiao、cpufreq、thermal、ir、cru）不写。
+ *   1) eMMC 的 compatible 追加 "snps,dw-mshc"，使主线 dw_mmc-pltfm 能够认领
+ *      （原 compatible 是国科 BSP 私有名，主线无此驱动）；
+ *   2) 各外设时钟改指下面的 fixed-clock，不再引用国科私有 CRU —— 主线没有
+ *      该 CRU 驱动，继续引用会让外设 probe 时永久 -EPROBE_DEFER；
+ *   3) 真机树里主线无驱动的节点（aiao 音频、cpufreq、thermal、ir、cru）不写。
+ *
+ * 中断 specifier：GICv3 为 3 个 cell = <类型 号 触发方式>，类型 0=SPI、1=PPI，
+ * 号是 GIC 视角的号（SPI 号 = 真机 /proc/interrupts 里的号 - 32）。
  */
 
 /dts-v1/;
 
-#include <dt-bindings/interrupt-controller/arm-gic.h>
-#include <dt-bindings/gpio/gpio.h>
-
 / {
-    model = "ChaoGe Z71A (GK6323V100C)";
-    compatible = "goke,gk6323v100c", "hisilicon,hi3798mv200";
-    interrupt-parent = <&gic>;
-    #address-cells = <2>;
-    #size-cells = <2>;
+	model = "ChaoGe Z71A (GK6323V100C) ARM64";
+	compatible = "chaoge,z71a", "goke,gk6323v100c";
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&gic>;
 
-    chosen {
-        stdout-path = "serial0:115200n8";
-    };
+	/* stdout-path = "serial0:..." 依赖这条别名，其余别名引导用不到 */
+	aliases {
+		serial0 = &uart0;
+	};
 
-    aliases {
-        serial0 = &uart0;
-        mmc0 = &emmc;
-        ethernet0 = &eth;
-    };
+	chosen {
+		/* 与 bootargs 分区一致；root= 亦由此下发 */
+		bootargs = "earlycon=pl011,mmio32,0xf8b00000,115200n8 console=ttyAMA0,115200n8 console=tty0 clk_ignore_unused net.ifnames=0 root=/dev/mmcblk0p18 rootfstype=ext4 rootwait rw panic=-1 blkdevparts=mmcblk0:1M(fastboot),512K(bootargs),512K(bootargsbak),20M(recovery),2M(deviceinfo),8M(securestore),2M(atf),8M(baseparam),8M(pqparam),2M(dtbo),10M(logo),10M(logobak),20M(fastplay),20M(recoverybak),60M(boot),20M(misc),20M(trustedcore),-(rootfs)";
+		stdout-path = "serial0:115200n8";
+	};
 
-    psci {
-        compatible = "arm,psci-1.0", "arm,psci-0.2";
-        method = "smc";
-    };
+	/*
+	 * 内存：2GiB，取自**真机导出的设备树**（hwinfo/hw1.txt 里的
+	 *   memory@0 { reg = <0x00 0x00 0x00 0x80000000>; }）
+	 * 与真机 /proc/meminfo 的 MemTotal: 2018984 kB，两者吻合。
+	 * ★ 不要被 U-Boot 那两行 "DRAM: 1 GiB" / "DDR Size: 1 GiB (Boot: 1 GiB)"
+	 *   误导：那是 U-Boot 自己的可映射上限（它启动内核只需 1GiB 就够），
+	 *   不代表硬件容量。写成 1GiB 会让内核白白少认一半内存。
+	 * 作者那版的 vdp@7f000000(2032MB) 与 framebuffer@7f511000 都在 2GiB 内，
+	 * 但本机第一阶段不用显示与硬解，故不写。
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00 0x00 0x00 0x80000000>;
+	};
 
-    cpus {
-        #address-cells = <1>;
-        #size-cells = <0>;
+	/* BL31(ATF) 与 OPTEE 占用区，必须告知内核，否则会被当作可用内存 */
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
 
-        cpu-map {
-            cluster0 {
-                core0 { cpu = <&cpu0>; };
-                core1 { cpu = <&cpu1>; };
-                core2 { cpu = <&cpu2>; };
-                core3 { cpu = <&cpu3>; };
-            };
-        };
+		bl31@8020000 {
+			reg = <0x00 0x8020000 0x00 0x200000>;
+			no-map;
+		};
 
-        cpu0: cpu@0 {
-            device_type = "cpu";
-            compatible = "arm,cortex-a55";
-            reg = <0x000>;
-            enable-method = "psci";
-            next-level-cache = <&l2>;
-        };
-        cpu1: cpu@1 {
-            device_type = "cpu";
-            compatible = "arm,cortex-a55";
-            reg = <0x001>;
-            enable-method = "psci";
-            next-level-cache = <&l2>;
-        };
-        cpu2: cpu@2 {
-            device_type = "cpu";
-            compatible = "arm,cortex-a55";
-            reg = <0x002>;
-            enable-method = "psci";
-            next-level-cache = <&l2>;
-        };
-        cpu3: cpu@3 {
-            device_type = "cpu";
-            compatible = "arm,cortex-a55";
-            reg = <0x003>;
-            enable-method = "psci";
-            next-level-cache = <&l2>;
-        };
+		optee@d200000 {
+			reg = <0x00 0xd200000 0x00 0x400000>;
+			no-map;
+		};
+	};
 
-        l2: l2-cache0 {
-            compatible = "cache";
-        };
-    };
+	/* 国科 CRU 无主线驱动，外设时钟一律用固定时钟，由 bootloader 保持上电 */
+	clocks {
+		clk_24m: clk-24m {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <24000000>;
+		};
 
-    /* 24MHz 外部晶振，时钟控制器依赖 */
-    osc24m: osc24m {
-        compatible = "fixed-clock";
-        #clock-cells = <0>;
-        clock-frequency = <24000000>;
-        clock-output-names = "osc24m";
-    };
+		clk_50m: clk-50m {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <50000000>;
+		};
 
-    timer {
-        compatible = "arm,armv8-timer";
-        interrupts = <GIC_PPI 13 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
-                     <GIC_PPI 14 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
-                     <GIC_PPI 11 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>,
-                     <GIC_PPI 10 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_LOW)>;
-        always-on;
-    };
+		clk_75m: clk-75m {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <75000000>;
+		};
+	};
 
-    /* 真机 2 GiB DDR */
-    memory@0 {
-        device_type = "memory";
-        reg = <0x0 0x00000000 0x0 0x80000000>;
-    };
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
 
-    reserved-memory {
-        #address-cells = <2>;
-        #size-cells = <2>;
-        ranges;
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a55";
+			reg = <0x0>;
+			enable-method = "psci";
+		};
 
-        /* ATF (BL31) 保留区，真机日志验证 */
-        bl31@8020000 {
-            reg = <0x0 0x08020000 0x0 0x00200000>;
-            no-map;
-        };
-    };
+		cpu1: cpu@100 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a55";
+			reg = <0x100>;
+			enable-method = "psci";
+		};
 
-    gic: interrupt-controller@f1000000 {
-        compatible = "arm,gic-v3";
-        #interrupt-cells = <3>;
-        #address-cells = <2>;
-        #size-cells = <2>;
-        ranges;
-        interrupt-controller;
-        reg = <0x0 0xf1000000 0x0 0x10000>,    /* GICD */
-              <0x0 0xf1080000 0x0 0x200000>;   /* GICR（REDIST */
-        interrupts = <GIC_PPI 9 (GIC_CPU_MASK_SIMPLE(4) | IRQ_TYPE_LEVEL_HIGH)>;
-    };
+		cpu2: cpu@200 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a55";
+			reg = <0x200>;
+			enable-method = "psci";
+		};
 
-    soc: soc@f0000000 {
-        compatible = "simple-bus";
-        #address-cells = <2>;
-        #size-cells = <2>;
-        ranges = <0x0 0x0 0x0 0xf0000000 0x0 0x10000000>;
-        dma-ranges;
+		cpu3: cpu@300 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a55";
+			reg = <0x300>;
+			enable-method = "psci";
+		};
+	};
 
-        uart0: serial@f8b00000 {
-            compatible = "arm,pl011", "arm,primecell";
-            reg = <0x0 0xf8b00000 0x0 0x1000>;
-            interrupts = <GIC_SPI 25 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&osc24m>, <&osc24m>;
-            clock-names = "uartclk", "apb_pclk";
-            status = "okay";
-        };
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "smc";
+	};
 
-        /* eMMC：追加 snps,dw-mshc 使主线 dw_mmc-pltfm 认领 */
-        emmc: mmc@f9820000 {
-            compatible = "goke,gk6323v100c-mshc", "snps,dw-mshc";
-            reg = <0x0 0xf9820000 0x0 0x2000>;
-            interrupts = <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&osc24m>, <&osc24m>, <&osc24m>;
-            clock-names = "ciu", "biu", "ciu-sample";
-            fifo-depth = <256>;
-            bus-width = <8>;
-            non-removable;
-            cap-mmc-highspeed;
-            cap-mmc-hs200-1_8v;
-            max-frequency = <150000000>;
-            status = "okay";
-        };
+	/* A55 的 arch timer：4 个 PPI，频率 24MHz（与真机一致） */
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <1 13 4>, <1 14 4>, <1 11 4>, <1 10 4>;
+		clock-frequency = <24000000>;
+	};
 
-        /* 千兆以太网 MAC */
-        eth: ethernet@f9c30000 {
-            compatible = "hisilicon,hi3798mv200-femac";
-            reg = <0x0 0xf9c30000 0x0 0x1000>,
-                  <0x0 0xf9c31000 0x0 0x1000>,
-                  <0x0 0xf9c32000 0x0 0x1000>;
-            reg-names = "mac", "glb", "mii";
-            interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&osc24m>, <&osc24m>;
-            clock-names = "stmmaceth", "mac-clk";
-            phy-mode = "rmii";
-            phy-handle = <&phy0>;
-            status = "okay";
+	gic: interrupt-controller@f1000000 {
+		compatible = "arm,gic-v3";
+		reg = <0x0 0xf1000000 0x0 0x10000>,
+		      <0x0 0xf1040000 0x0 0x80000>;
+		interrupt-controller;
+		#interrupt-cells = <3>;
+	};
 
-            mdio {
-                #address-cells = <1>;
-                #size-cells = <0>;
-                phy0: ethernet-phy@2 {
-                    reg = <0x2>;
-                };
-            };
-        };
+	soc: soc@f0000000 {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges = <0xf0000000 0x0 0xf0000000 0x10000000>;
 
-        /* USB 2.0 Host (OHCI+EHCI) */
-        usb@f9880000 {
-            compatible = "generic-ohci";
-            reg = <0x0 0xf9880000 0x0 0x1000>;
-            interrupts = <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&osc24m>;
-            status = "okay";
-        };
-        usb@f9890000 {
-            compatible = "generic-ehci";
-            reg = <0x0 0xf9890000 0x0 0x1000>;
-            interrupts = <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&osc24m>;
-            status = "okay";
-        };
+		/* 控制台串口：bootargs 的 console=ttyAMA0 指这里 */
+		uart0: serial@f8b00000 {
+			compatible = "arm,pl011", "arm,primecell";
+			reg = <0xf8b00000 0x1000>;
+			interrupts = <0 49 4>;
+			clocks = <&clk_75m>, <&clk_75m>;
+			clock-names = "uartclk", "apb_pclk";
+		};
 
-        /* RTC */
-        rtc@f8a00000 {
-            compatible = "hisilicon,hi6220-rtc";
-            reg = <0x0 0xf8a00000 0x0 0x1000>;
-            interrupts = <GIC_SPI 18 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&osc24m>;
-            status = "okay";
-        };
+		/* 板载 RTC：PCF8563 挂在 i2c2 上，地址 0x51 */
+		i2c2: i2c@f8b12000 {
+			compatible = "hisilicon,hix5hd2-i2c";
+			reg = <0xf8b12000 0x1000>;
+			interrupts = <0 40 4>;
+			clocks = <&clk_50m>;
+			clock-names = "apb_pclk";
+			clock-frequency = <100000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
 
-        /* 看门狗 */
-        watchdog@f8003000 {
-            compatible = "arm,sp805", "arm,primecell";
-            reg = <0x0 0xf8003000 0x0 0x1000>;
-            interrupts = <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&osc24m>, <&osc24m>;
-            clock-names = "wdogclk", "apb_pclk";
-            status = "okay";
-        };
-    };
+			rtc@51 {
+				compatible = "nxp,pcf8563";
+				reg = <0x51>;
+			};
+		};
+
+		/*
+		 * eMMC：根文件系统在 mmcblk0p18，本项必须起来。
+		 * 第二段 reg 是国科 CRU 里那 0x40 字节的 SD 时钟控制寄存器，保留原位，
+		 * 主线驱动不会去动它（时钟由 bootloader 保持上电）。
+		 */
+		emmc: mmc@f9830000 {
+			compatible = "goke,gk6323v100c-dw-mshc", "snps,dw-mshc";
+			reg = <0xf9830000 0x1000>, <0xf8a21000 0x40>;
+			interrupts = <0 35 4>;
+			clocks = <&clk_50m>, <&clk_50m>;
+			clock-names = "biu", "ciu";
+			fifo-depth = <0x100>;
+			card-detect-delay = <200>;
+			bus-width = <8>;
+			non-removable;
+			mmc-ddr-1_8v;
+			disable-wp;
+		};
+
+		/* 板载百兆网口：PHY 挂在下面的 mdio 总线上，地址 2 */
+		femac: ethernet@f9c30000 {
+			compatible = "hisilicon,hisi-femac-v2";
+			reg = <0xf9c30000 0x1000>, <0xf9c31300 0x300>;
+			interrupts = <0 72 4>;
+			clocks = <&clk_75m>;
+			phy-mode = "mii";
+			phy-handle = <&phy2>;
+		};
+
+		mdio@f9c31100 {
+			compatible = "hisilicon,hisi-femac-mdio";
+			reg = <0xf9c31100 0x100>;
+			clocks = <&clk_75m>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			phy2: ethernet-phy@2 {
+				reg = <0x2>;
+			};
+		};
+
+		/* USB2.0：真机只有 EHCI/OHCI，无 xhci */
+		ohci: usb@f9880000 {
+			compatible = "generic-ohci";
+			reg = <0xf9880000 0x10000>;
+			interrupts = <0 67 4>;
+		};
+
+		ehci: usb@f9890000 {
+			compatible = "generic-ehci";
+			reg = <0xf9890000 0x10000>;
+			interrupts = <0 66 4>;
+		};
+
+		/* SP805 看门狗：也是 panic 后重启的复位通道 */
+		watchdog@f8a2c000 {
+			compatible = "arm,sp805-wdt", "arm,primecell";
+			reg = <0xf8a2c000 0x1000>;
+			clocks = <&clk_24m>;
+			clock-names = "apb_pclk";
+			clock-frequency = <24000000>;
+			timeout-sec = <60>;
+		};
+	};
 };

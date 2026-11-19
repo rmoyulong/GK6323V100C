@@ -1,123 +1,149 @@
 #!/bin/bash
+set -uo pipefail
+
 # ============================================================
-# verify-device.sh —— GK6323V100C 主线内核实机自检
+# GK6323V100C 目标机自检：一条命令看新内核有没有真的生效、
+# USB 声卡能不能用、以及刷错带来的可见后果。
 #
-# 用法：sudo bash scripts/verify-device.sh
-# 七组检查：内核/串口/eMMC/网口/USB/音频/模块，末尾给 PASS/FAIL/SKIP 汇总。
-# 全通过退出码 0，任一关键项失败退出码 1。
+# 用法：sudo bash verify-device.sh
+# 七组检查，末尾给 PASS / FAIL / SKIP 汇总；有 FAIL 时退出码非 0。
+#
+# 说明：SKIP 表示「当前条件下测不了」，不算失败，例如没插 USB 声卡。
 # ============================================================
-set -u
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 PASS=0; FAIL=0; SKIP=0
+ok()  { echo "    [PASS] $1"; PASS=$((PASS+1)); }
+ng()  { echo "    [FAIL] $1"; FAIL=$((FAIL+1)); }
+sk()  { echo "    [SKIP] $1"; SKIP=$((SKIP+1)); }
+sec() { echo; echo "== $1 =="; }
 
-pass() { echo -e "${GREEN}[PASS]${NC} $1"; PASS=$((PASS+1)); }
-fail() { echo -e "${RED}[FAIL]${NC} $1"; FAIL=$((FAIL+1)); }
-skip() { echo -e "${YELLOW}[SKIP]${NC} $1"; SKIP=$((SKIP+1)); }
+echo "GK6323V100C 内核自检  时间：$(date '+%F %T')"
 
-echo "============================================================"
-echo "GK6323V100C 主线内核自检"
-echo "时间：$(date)"
-echo "主机：$(hostname)"
-echo "============================================================"
-echo
-
-# 1. 内核版本
-echo "[1/7] 内核版本"
-KVER="$(uname -r)"
-echo "    版本：$KVER"
-echo "    架构：$(uname -m)"
-if echo "$KVER" | grep -qE '^[0-9]+\.[0-9]+'; then
-    pass "内核启动成功（$KVER）"
+# ---- 1. 内核版本 ----
+sec "1. 内核版本"
+KREL="$(uname -r)"
+echo "    运行内核：$KREL"
+if [ "$KREL" = "6.18.46-gk6323-debian" ]; then
+  ng "还是作者那版 BSP 内核，说明 boot 分区没换成功"
 else
-    fail "无法识别内核版本"
+  ok "内核已替换（$KREL）"
+fi
+sed -n '1p' /proc/version | sed 's/^/    /'
+
+# ---- 2. 模块支持 ----
+sec "2. 模块支持"
+if [ -r /proc/modules ]; then
+  N="$(wc -l < /proc/modules)"
+  ok "/proc/modules 可读，已加载模块 $N 个（内核带 CONFIG_MODULES）"
+else
+  ng "/proc/modules 不存在：这版内核仍是纯内置内核，insmod / modprobe 都用不了"
+fi
+if command -v modinfo >/dev/null 2>&1; then
+  if modinfo snd-usb-audio >/dev/null 2>&1; then
+    ok "snd-usb-audio 在内核或模块里可见"
+  else
+    ng "找不到 snd-usb-audio：USB 声卡驱动没编进去"
+  fi
+else
+  sk "没有 modinfo 命令（kmod 未装），跳过驱动存在性检查"
 fi
 
-# 2. 串口控制台
-echo
-echo "[2/7] 串口控制台"
-CMDLINE="$(cat /proc/cmdline 2>/dev/null || echo '')"
-if echo "$CMDLINE" | grep -q 'ttyAMA'; then
-    pass "内核命令行包含串口控制台"
-    echo "    cmdline: $CMDLINE"
-elif [ -c /dev/ttyAMA0 ] || [ -c /dev/console ]; then
-    pass "控制台设备节点存在"
+# ---- 3. 设备树 ----
+sec "3. 设备树"
+MODEL=""
+for p in /sys/firmware/devicetree/base/model /proc/device-tree/model; do
+  [ -r "$p" ] && { MODEL="$(tr -d '\0' < "$p")"; break; }
+done
+if [ -n "$MODEL" ]; then
+  echo "    设备树 model：$MODEL"
+  case "$MODEL" in
+    *Z71A*|*GK6323V100C*|*gk6323v100c*) ok "板级设备树是本机型（GK6323V100C / Z71A）" ;;
+    *) ng "设备树 model 不是本机型，dtb 可能没换" ;;
+  esac
 else
-    fail "未检测到串口控制台"
+  sk "读不到设备树 model 节点"
 fi
 
-# 3. eMMC
-echo
-echo "[3/7] eMMC 存储"
-if [ -b /dev/mmcblk0 ]; then
-    SIZE=$(cat /sys/block/mmcblk0/size 2>/dev/null)
-    SIZE_MB=$((SIZE*512/1024/1024))
-    pass "eMMC 检测到（/dev/mmcblk0，约 ${SIZE_MB}MB）"
-    echo "    分区数：$(ls /dev/mmcblk0p* 2>/dev/null | wc -l)"
+# ---- 4. 分区表与根文件系统 ----
+sec "4. 分区表与根文件系统"
+NPART="$(grep -c 'mmcblk0p' /proc/partitions || true)"
+if [ "$NPART" -ge 18 ]; then
+  ok "看到 $NPART 个 mmcblk0 分区（bootargs 里的 blkdevparts= 生效）"
 else
-    fail "未检测到 eMMC（/dev/mmcblk0 不存在）"
+  ng "只看到 $NPART 个 mmcblk0 分区，命令行分区表可能没生效"
+fi
+ROOTSRC="$(findmnt -no SOURCE / 2>/dev/null || true)"
+ROOTFST="$(findmnt -no FSTYPE / 2>/dev/null || true)"
+echo "    根分区：$ROOTSRC ($ROOTFST)"
+if [ "$ROOTSRC" = "/dev/mmcblk0p18" ]; then
+  ok "根分区在 /dev/mmcblk0p18"
+else
+  ng "根分区不是 /dev/mmcblk0p18，与本机型布局不符"
+fi
+if [ -d "/lib/modules/$KREL" ]; then
+  ok "模块目录存在：/lib/modules/$KREL"
+else
+  ng "/lib/modules/$KREL 不存在：模块没装，或内核与模块不是同一版"
 fi
 
-# 4. 网口
-echo
-echo "[4/7] 以太网"
-if ls /sys/class/net/eth* 1>/dev/null 2>&1; then
-    IF=$(ls /sys/class/net/eth* 2>/dev/null | head -1 | xargs -I{} basename {})
-    IP=$(ip -4 addr show "$IF" 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
-    LINK=$(cat /sys/class/net/"$IF"/carrier 2>/dev/null || echo 0)
-    if [ "$LINK" = "1" ]; then
-        pass "网口 $IF 已连接（IP: ${IP:-未分配}）"
+# ---- 5. USB 主控 ----
+sec "5. USB 主控"
+if ls /sys/bus/usb/devices/ 2>/dev/null | grep -q 'usb'; then
+  grep -H -m1 . /sys/bus/usb/devices/usb*/product 2>/dev/null | sed 's/^/    /' || true
+  ok "USB 总线已枚举（$(ls -d /sys/bus/usb/devices/usb* 2>/dev/null | wc -l) 个根集线器）"
+else
+  ng "没有任何 USB 根集线器：EHCI/OHCI 驱动或 PHY 没起来"
+fi
+
+# ---- 6. USB 声卡 ----
+sec "6. USB 声卡"
+CARDS=""
+[ -r /proc/asound/cards ] && CARDS="$(cat /proc/asound/cards)"
+if [ -n "$CARDS" ]; then
+  echo "$CARDS" | sed 's/^/    /'
+  if echo "$CARDS" | grep -qi 'usb'; then
+    ok "已识别到 USB 声卡"
+  else
+    echo "    以上没有 USB 声卡；若已插上 USB 声卡，说明驱动仍没接管"
+  fi
+else
+  sk "/proc/asound/cards 不可读（没有 USB 声卡时也可能如此）"
+fi
+if command -v lsusb >/dev/null 2>&1; then
+  if ! lsusb -t 2>/dev/null | grep -qi 'Audio'; then
+    sk "USB 树里没有 Audio 接口（没插声卡时正常）"
+  else
+    lsusb -t 2>/dev/null | sed 's/^/    /'
+    if lsusb -t 2>/dev/null | grep -i 'Audio' | grep -q 'snd-usb-audio'; then
+      ok "Audio 接口已被 snd-usb-audio 接管"
     else
-        pass "网口 $IF 存在但未插线"
+      ng "Audio 接口存在但 Driver 一栏为空：USB 音频驱动没接管"
     fi
+  fi
 else
-    fail "未检测到以太网接口"
+  sk "没有 lsusb 命令，跳过 USB 树检查"
+fi
+if command -v aplay >/dev/null 2>&1; then
+  aplay -l 2>/dev/null | sed 's/^/    /' || true
+else
+  sk "没有 aplay，跳过播放设备列表"
 fi
 
-# 5. USB 主控制器
-echo
-echo "[5/7] USB 主控"
-USB_LS=$(lsusb 2>/dev/null || echo '')
-if ls /sys/bus/usb/devices/usb* 1>/dev/null 2>&1; then
-    USB_CNT=$(ls /sys/bus/usb/devices/usb* 2>/dev/null | wc -l)
-    pass "USB 主控存在（${USB_CNT} 个）"
-    if [ -n "$USB_LS" ]; then
-        echo "    $USB_LS" | sed 's/^/    /'
-    fi
+# ---- 7. 网络 ----
+sec "7. 网络"
+if command -v ip >/dev/null 2>&1; then
+  ip -br link 2>/dev/null | sed 's/^/    /' || true
+  if ip -br link 2>/dev/null | grep -qE '^eth0(@[^ ]+)? +UP'; then
+    ok "eth0 已 UP"
+  else
+    ng "eth0 没 UP：femac 或 PHY 没起来"
+  fi
 else
-    fail "未检测到 USB 主控"
-fi
-
-# 6. 内核模块支持
-echo
-echo "[6/7] 模块支持"
-if [ -d "/lib/modules/$KVER" ]; then
-    MOD_CNT=$(find "/lib/modules/$KVER" -name '*.ko*' -type f 2>/dev/null | wc -l)
-    pass "模块目录存在（约 ${MOD_CNT} 个模块）"
-else
-    fail "/lib/modules/$KVER 不存在（模块未安装）"
-fi
-
-# 7. USB 音频模块
-echo
-echo "[7/7] USB 音频"
-if lsmod 2>/dev/null | grep -q snd_usb_audio; then
-    CARD=$(cat /proc/asound/cards 2>/dev/null | grep -i usb | head -1)
-    pass "snd-usb-audio 已加载"
-    [ -n "$CARD" ] && echo "    $CARD" | sed 's/^/    /'
-elif [ -f "/lib/modules/$KVER/kernel/sound/usb/snd-usb-audio.ko" ] || \
-     [ -f "/lib/modules/$KVER/kernel/sound/usb/snd-usb-audio.ko.xz"] || \
-     [ -f "/lib/modules/$KVER/kernel/sound/usb/snd-usb-audio.ko.gz" ]; then
-    skip "snd-usb-audio 模块已安装但未加载（插卡后 modprobe snd-usb-audio）"
-else
-    fail "snd-usb-audio.ko 未找到（检查 modules.tar.gz 是否正确解压）"
+  sk "没有 ip 命令，跳过"
 fi
 
 echo
-echo "============================================================"
-echo "汇总：$PASS 通过 / $FAIL 失败 / $SKIP 跳过"
-echo "============================================================"
-if [ "$FAIL" -gt 0 ]; then
-    exit 1
-fi
-exit 0
+echo "=========================================="
+echo "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
+echo "=========================================="
+[ "$FAIL" -eq 0 ] || exit 1
