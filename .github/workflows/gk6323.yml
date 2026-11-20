@@ -455,13 +455,16 @@ jobs:
           # 板载 ES8316 走国科 AIAO 那一路。补丁库 505-03 / 505-04 提供了 AIAO 的
           # I2S 端口与声卡驱动，符号名逐字核对为 SND_SOC_HISTB_AIAO_I2S 与
           # SND_SOC_HISTB_AIAO_CARD（**没有** SND_SOC_HISTB_AIAO 这个符号），
-          # 配合 codec SND_SOC_ES8316 才有可能出声。这里一并打开，等设备树接上
-          # AIAO 节点后即可 bind（dts 侧另议）。
+          # 配合 codec SND_SOC_ES8316 才有可能出声。这里一并打开；设备树侧的
+          # AIAO / ES8316 / sound 三个节点已在本版接上。
           scripts/config --enable SND
           scripts/config --enable SND_SOC
           scripts/config --enable SND_SOC_ES8316
           scripts/config --enable SND_SOC_HISTB_AIAO_I2S
           scripts/config --enable SND_SOC_HISTB_AIAO_CARD
+          # simple-audio-card：与真机原树一样，板载 ES8316 用 generic 声卡绑定，
+          # 不写 histb 那张专用卡节点。缺了这个符号，sound{} 节点无人认领。
+          scripts/config --enable SND_SIMPLE_CARD
           scripts/config --enable I2C
           # 板载百兆网口（★ 同样先开父菜单 NET_VENDOR_HISILICON，并带上 PHYLIB）
           scripts/config --enable PHYLIB
@@ -586,6 +589,7 @@ jobs:
                    DEBUG_FS \
                    SND SND_USB SND_SOC SND_SOC_ES8316 \
                    SND_SOC_HISTB_AIAO_I2S SND_SOC_HISTB_AIAO_CARD \
+                   SND_SIMPLE_CARD \
                    NLS NLS_UTF8 NLS_CODEPAGE_936; do
             if grep -qE "^CONFIG_${s}=[ym]$" .config; then
               echo "OK   $(grep -E "^CONFIG_${s}=" .config)"
@@ -755,6 +759,7 @@ jobs:
           for k in "arm,cortex-a55" "arm,gic-v3" "arm,pl011" "goke,gk6323v100c" \
                    "goke,gk6323v100c-crg" "goke,gk6323v100c-dw-mshc" "snps,dw-mshc" \
                    "hisilicon,hisi-femac-v2" "hisilicon,hisi-femac-mdio" \
+                   "hisilicon,hi3798mv200-aiao-i2s" "everest,es8316" \
                    "generic-ehci" "generic-ohci" \
                    "nxp,pcf8563" "arm,sp805-wdt"; do
             if grep -q "$k" /tmp/rt.dts; then

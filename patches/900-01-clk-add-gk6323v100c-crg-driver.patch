@@ -1,20 +1,20 @@
-From 517199d14cf62bffcc042f299030eb2de8f47093 Mon Sep 17 00:00:00 2001
+From 6a02b2c6568902882c4350909f5fb4c90f87b1a4 Mon Sep 17 00:00:00 2001
 From: build <b@local>
 Date: Sat, 21 Nov 2026 02:04:47 +0800
 Subject: [PATCH] clk: hisilicon: add the GK6323V100C CRG gate/reset preset
  driver
 
 ---
- drivers/clk/hisilicon/crg-gk6323v100c.c | 275 ++++++++++++++++++++++++
- 1 file changed, 275 insertions(+)
+ drivers/clk/hisilicon/crg-gk6323v100c.c | 279 ++++++++++++++++++++++++
+ 1 file changed, 279 insertions(+)
  create mode 100644 drivers/clk/hisilicon/crg-gk6323v100c.c
 
 diff --git a/drivers/clk/hisilicon/crg-gk6323v100c.c b/drivers/clk/hisilicon/crg-gk6323v100c.c
 new file mode 100644
-index 0000000..3a20ae2
+index 0000000..1ff83d6
 --- /dev/null
 +++ b/drivers/clk/hisilicon/crg-gk6323v100c.c
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,279 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * GK6323V100C（国科微）CRG 门控/复位预置驱动
@@ -114,6 +114,9 @@ index 0000000..3a20ae2
 +	{ 0xd0, 0 },	/* clk_femacif（bus） */
 +	{ 0xd0, 1 },	/* clk_femac */
 +	{ 0x388, 0 },	/* clk_fephy */
++
++	/* AIAO：PERI_CRG70 @ 0x118，bit0 工作时钟、bit4 软复位 */
++	{ 0x118, 0 },	/* clk_aiao */
 +};
 +
 +/* 需要在 probe 时先释放掉的软复位（写 0 = 释放） */
@@ -127,6 +130,7 @@ index 0000000..3a20ae2
 +	{ 0xbc, 8 },	/* USB2 端口 0 */
 +	{ 0xbc, 9 },	/* USB2 端口 1 */
 +	{ 0xd0, 3 },	/* FEMAC mac 软复位 */
++	{ 0x118, 4 },	/* AIAO 软复位 */
 +};
 +
 +struct gk_crg_priv {

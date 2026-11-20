@@ -25,7 +25,8 @@
  * 与真机原树的有意差异（让主线内核能认领硬件）：
  *   1) eMMC 的 compatible 追加 "snps,dw-mshc"，使主线 dw_mmc-pltfm 能够认领；
  *   2) 各外设时钟用下面的 fixed-clock，不再引用国科私有 CRU；
- *   3) 真机树里主线无驱动的节点（aiao 音频、cpufreq、thermal、ir）不写。
+ *   3) 真机树里主线无驱动的节点（cpufreq、thermal、ir）不写；
+ *      aiao 音频改用补丁库 605-03 的 hisilicon,hi3798mv200-aiao-i2s 节点。
  *
  * 中断 specifier：GICv3 为 3 个 cell = <类型 号 触发方式>，类型 0=SPI、1=PPI，
  * 号是 GIC 视角的号（SPI 号 = 真机 /proc/interrupts 里的号 - 32）。
@@ -112,6 +113,18 @@
 			compatible = "fixed-clock";
 			#clock-cells = <0>;
 			clock-frequency = <75000000>;
+		};
+
+		/*
+		 * AIAO 送给板载 ES8316 的 MCLK。48k 家族要 256×fs = 12.288MHz，
+		 * 与下面 sound 节点的 simple-audio-card,mclk-fs = <256> 对应。
+		 * 真实 MCLK 引脚由 AIAO 块自己按 245.76MHz 分频驱动（在驱动里），
+		 * 这里这条只让 codec 驱动知道该按什么频率算。
+		 */
+		clk_12288: clk-12288 {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <12288000>;
 		};
 	};
 
@@ -217,6 +230,15 @@
 				compatible = "nxp,pcf8563";
 				reg = <0x51>;
 			};
+
+			/* 板载声卡 codec：ES8316，地址 0x10（与真机原树一致） */
+			es8316: audio-codec@10 {
+				compatible = "everest,es8316";
+				reg = <0x10>;
+				clocks = <&clk_12288>;
+				clock-names = "mclk";
+				#sound-dai-cells = <0>;
+			};
 		};
 
 		/*
@@ -240,16 +262,29 @@
 
 		/*
 		 * 板载百兆网口：PHY 挂在下面的 mdio 总线上，地址 2。
-		 * resets 只写 "mac"（0xd0 bit3）：hisi_femac 对它是强制要求，
-		 * 缺了 probe 就报 -ENOENT；"phy" 故意不给，理由见文件头。
+		 *
+		 * resets 两条都要，与补丁库 815-02 的 Hi3798MV200 节点同款：
+		 *   "mac" = PERI_CRG51 @ 0xd0 bit3 —— hisi_femac 对它是强制要求，
+		 *          缺了 probe 直接 -ENOENT（日志里那条 error -2 就是它）；
+		 *   "phy" = PERI_CRG_FEPHY @ 0x388 bit4 —— 内部 FE PHY 的软复位。
+		 *          hisi_femac 里 phy_rst 是可选的（if (priv->phy_rst)），
+		 *          之前没声明它，官方那套「释放→延时→拉低→再释放」的 PHY
+		 *          复位脉冲一次都没跑过，PHY 停在复位态：MDIO 上认得到，
+		 *          但能力寄存器读不出（ethtool 显示 Supported link modes:
+		 *          Not reported、Supports auto-negotiation: No），协商不上，
+		 *          网口一个灯都不亮。
+		 * 只要声明了 "phy"，驱动就会去读 hisilicon,phy-reset-delays-us
+		 * （(预延时, 复位脉宽, 后延时)，单位 us；缺了这个属性 probe 会失败），
+		 * 所以下面三个数必须和 "phy" 一起给。
 		 */
 		femac: ethernet@f9c30000 {
 			compatible = "hisilicon,hisi-femac-v2";
 			reg = <0xf9c30000 0x1000>, <0xf9c31300 0x300>;
 			interrupts = <0 72 4>;
 			clocks = <&clk_75m>;
-			resets = <&cru 0xd0 3>;
-			reset-names = "mac";
+			resets = <&cru 0xd0 3>, <&cru 0x388 4>;
+			reset-names = "mac", "phy";
+			hisilicon,phy-reset-delays-us = <10000 10000 500000>;
 			phy-mode = "mii";
 			phy-handle = <&phy2>;
 		};
@@ -264,6 +299,24 @@
 			phy2: ethernet-phy@2 {
 				reg = <0x2>;
 			};
+		};
+
+		/*
+		 * AIAO 音频控制器（国科叫 gk6323-aiao，寄存器与海思 mv200 同源）。
+		 * 主板把 I2S 送给 i2c2 上的 ES8316，MCLK 也由本块产生。
+		 *
+		 * compatible 取补丁库 605-03 那句话。注意它的 mv200 变体表只暴露
+		 * HDMI 那个发送端口（DAI 索引 0），板载 ES8316 若接在别的发送端口上，
+		 * 声卡能建起来但不出声 —— 那一步要改驱动端口表，不在设备树里。
+		 */
+		aiao: audio@f8cd0000 {
+			compatible = "hisilicon,hi3798mv200-aiao-i2s";
+			reg = <0xf8cd0000 0x4000>;
+			interrupts = <0 84 4>;
+			clocks = <&clk_50m>, <&clk_12288>;
+			clock-names = "aiao", "mclk";
+			resets = <&cru 0x118 4>;
+			#sound-dai-cells = <1>;
 		};
 
 		/*
@@ -292,6 +345,30 @@
 			clock-names = "apb_pclk";
 			clock-frequency = <24000000>;
 			timeout-sec = <60>;
+		};
+	};
+
+	/*
+	 * 声卡：与真机原树同构 —— simple-audio-card，CPU DAI 是 AIAO，
+	 * codec 是 ES8316，AIAO 当 bitclock/frame 主（AIAO 的 dai 只接受
+	 * CBP_CFP，所以两个 master 都指 cpu 子节点）。
+	 */
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "GK6323-ES8316";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,bitclock-master = <&dailink_master>;
+		simple-audio-card,frame-master = <&dailink_master>;
+		simple-audio-card,widgets = "Headphone", "Headphones";
+		simple-audio-card,routing = "Headphones", "HPOL", "Headphones", "HPOR";
+
+		dailink_master: simple-audio-card,cpu {
+			sound-dai = <&aiao 0>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&es8316>;
 		};
 	};
 };
