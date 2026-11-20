@@ -875,14 +875,6 @@ jobs:
           retention-days: 90
           path: linux_build/out/*
 
-      - name: 发布到 GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd linux_build/out
-          TAG="gk6323v100c-${PATCHES_KERNEL_VERSION}-b${GITHUB_RUN_NUMBER}"
-          KREL="$PATCHES_KERNEL_VERSION"
 
       - name: 生成发布说明
         env:
@@ -1014,3 +1006,4 @@ jobs:
             linux_build/out/Image
             linux_build/out/sha256sums.txt
             linux_build/out/config-*             
+
