@@ -754,15 +754,45 @@ jobs:
           #     bl33_ep->spsr = 0x3C5 / Start Warm Reseting
           #   之后彻底无声 —— 既没有内核日志，也没有任何报错。这条断言让同类错误
           #   在 CI 里当场暴露，而不是等刷进机器、对着空串口猜。
-          #   取值一律带兜底，遵守本文件「赋值 + 管道」的纪律。
+          #   ★ 比的是数值，不是字符串。mkimage -l 打印的是不带 0x 的 "02000000"
+          #     （有的版本会带 0x，有的会把十六进制字母打成大写），拿它直接和
+          #     "0x02000000" 做字符串比较，会把地址完全正确的镜像判死 ——
+          #     2026-11-20 那次构建就是这么被自己的断言拦下来的：头里明明是
+          #     Load/Entry = 02000000，却被报成「与期望不符」。故先经 hexnorm
+          #     统一成 0x%08x 再比，取值一律带兜底，遵守本文件「赋值 + 管道」的纪律。
+          #   十六进制归一：剥掉可选的 0x/0X，校验只含十六进制字符，再按数值
+          #   重新格式化为小写 0x%08x。读到非十六进制或是空串时返回非零，
+          #   由调用处兜底成空字符串（这样「读不到」与「读错」能区分开）。
+          hexnorm() {
+            local v
+            # 先抹掉所有空白字符：不同版本的 mkimage 会在数值后多打一个空格，
+            # 尾随空格若留在串里，下面的字符集校验会把它判成非法字符。
+            v="$(printf '%s' "$1" | tr -d '[:space:]' || true)"
+            v="${v#0x}"
+            v="${v#0X}"
+            case "$v" in
+              ''|*[!0-9a-fA-F]*) return 1 ;;
+            esac
+            printf '0x%08x' "$((16#$v))"
+          }
           IMG_LD="$(mkimage -l arch/arm64/boot/boot.img | sed -n 's/^Load Address:[[:space:]]*//p' | head -1 || true)"
           IMG_EP="$(mkimage -l arch/arm64/boot/boot.img | sed -n 's/^Entry Point:[[:space:]]*//p' | head -1 || true)"
           echo "头内 Load Address = ${IMG_LD:-（未读到）} ；Entry Point = ${IMG_EP:-（未读到）}"
-          if [ "$IMG_LD" != "$UIMAGE_LOADADDR" ] || [ "$IMG_EP" != "$UIMAGE_ENTRYADDR" ]; then
-            echo "::error::uImage 头内 Load/Entry 与期望不符：期望 $UIMAGE_LOADADDR / $UIMAGE_ENTRYADDR，实际 $IMG_LD / $IMG_EP"
+          LD_ACT="$(hexnorm "$IMG_LD" || true)"
+          EP_ACT="$(hexnorm "$IMG_EP" || true)"
+          LD_EXP="$(hexnorm "$UIMAGE_LOADADDR" || true)"
+          EP_EXP="$(hexnorm "$UIMAGE_ENTRYADDR" || true)"
+          echo "归一后 Load/Entry = ${LD_ACT:-（解析失败）} / ${EP_ACT:-（解析失败）} ；期望 ${LD_EXP:-（解析失败）} / ${EP_EXP:-（解析失败）}"
+          if [ -z "$LD_ACT" ] || [ -z "$EP_ACT" ]; then
+            echo "::error::读不到 uImage 头里的 Load/Entry（读到 '$IMG_LD' / '$IMG_EP'），无法确认跳转地址"
+            exit 1
+          fi
+          if [ "$LD_ACT" != "$LD_EXP" ] || [ "$EP_ACT" != "$EP_EXP" ]; then
+            echo "::error::uImage 头内 Load/Entry 与期望不符：期望 $LD_EXP / $EP_EXP，实际 $LD_ACT / $EP_ACT"
             echo "::error::ATF 按 ih_ep 跳转，地址不对会在 'Start Warm Reseting' 之后无声死机。"
             exit 1
           fi
+          echo "OK   uImage 头内地址与期望一致（$LD_ACT / $EP_ACT）"
           if ! mkimage -l arch/arm64/boot/boot.img | grep -q '(uncompressed)'; then
             echo "::error::uImage 不是未压缩镜像 —— 原厂头实测 ih_comp=0（-C none），请确认 mkimage 参数没有被改动"
             exit 1
