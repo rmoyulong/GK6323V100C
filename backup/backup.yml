@@ -31,7 +31,9 @@ name: GK6323V100C 内核自动构建
 #   c) 真机运行的设备树来自 dtbo 分区（作者 boot.img 内没有 dtb）。因此
 #      编译出的 dtb **必须写入 dtbo 分区**才能生效；内嵌的那份是冗余备份。
 #      注意：legacy uImage 的 bootm 不会解析「追加在 Image 末尾的 dtb」，
-#      要让内核拿到设备树，必须 `bootm <kernel> - <fdt>` 显式传第三个参数。
+#      本机 bootcmd 是 `bootm 0x04000000`（不带第三个 fdt 参数），内核拿不到有效
+#      fdt —— 已由下面「给内核打 dtb 兜底补丁」一步在 primary_entry 处兜底改用
+#      0x03FFC000 处的设备树，**不需要**手动传第三个参数。
 #
 # 纪律（踩过坑，勿犯）：
 #   set -euo pipefail 之下，任何「赋值 + 管道」都必须兜底。写成
@@ -107,11 +109,11 @@ jobs:
       - name: 校验必要文件存在
         run: |
           set -euo pipefail
-          for f in apply_histb_patches.sh "$FRAGMENT" "$BOARD_DTS"; do
+          for f in apply_histb_patches.sh "$FRAGMENT" slim.config "$BOARD_DTS" dts/check-dts.py; do
             [ -f "$f" ] || { echo "::error::根目录缺少 $f"; exit 1; }
           done
           chmod +x apply_histb_patches.sh
-          ls -lh apply_histb_patches.sh "$FRAGMENT" "$BOARD_DTS"
+          ls -lh apply_histb_patches.sh "$FRAGMENT" slim.config "$BOARD_DTS" dts/check-dts.py
 
       - name: 工作流静态自检（防 set -e + pipefail 下的裸管道赋值）
         run: |
@@ -246,6 +248,7 @@ jobs:
           code = ''.join([
               '\t/* GK6323_DTB_FALLBACK: use the dtb at 0x03FFC000 when x0 is not an fdt */\n',
               '\tldr\tw20, [x0]\n',
+              '\trev\tw20, w20\n',
               '\tmovz\tw21, #0xfeed\n',
               '\tmovk\tw21, #0xd00d, lsl #16\n',
               '\tcmp\tw20, w21\n',
@@ -264,6 +267,103 @@ jobs:
           GKDTB
           echo "=== 插入结果 ==="
           grep -n -B1 -A10 'GK6323_DTB_FALLBACK' arch/arm64/kernel/head.S
+
+      - name: 设备树硬件节点补丁（补全CRU时钟/USB PHY/外设复位，解决网卡USB声卡全挂）
+        run: |
+          set -euo pipefail
+          cd linux_build
+          # 用python写补丁避免YAML缩进/heredoc问题
+          cat > patch_dts.py << 'PY'
+          import os
+          from pathlib import Path
+          dts = Path(f"../{os.environ['BOARD_DTS']}")
+          t = dts.read_text()
+          if 'f8a22000.clock' in t:
+              print('硬件节点已存在，跳过')
+              exit(0)
+          # 补丁内容全部用空格缩进，不影响dts语法
+          p = [
+              '&soc {',
+              '\tclk: clock-controller@f8a22000 {',
+              '\t\tcompatible = "hisilicon,hi3798mv200-cru";',
+              '\t\treg = <0x0 0xf8a22000 0x0 0x1000>;',
+              '\t\t#clock-cells = <1>;',
+              '\t\t#reset-cells = <2>;',
+              '\t\tclocks = <&osc24m>;',
+              '\t\tclock-names = "osc";',
+              '\t};',
+              '',
+              '\tusb2_phy: usb-phy@f98c0000 {',
+              '\t\tcompatible = "hisilicon,hi3798cv200-usb2-phy";',
+              '\t\treg = <0x0 0xf98c0000 0x0 0x100>;',
+              '\t\t#phy-cells = <0>;',
+              '\t\tclocks = <&clk 0x12>;',
+              '\t\tclock-names = "phy";',
+              '\t\tresets = <&clk 0x10 0>;',
+              '\t\treset-names = "phy";',
+              '\t};',
+              '',
+              '\tsyscon@f8a20000 {',
+              '\t\tcompatible = "syscon", "simple-mfd";',
+              '\t\treg = <0x0 0xf8a20000 0x0 0x1000>;',
+              '\t};',
+              '};',
+              '',
+              '&eth {',
+              '\tclocks = <&clk 0x38>, <&clk 0x39>;',
+              '\tclock-names = "stmmaceth", "mac_clk_rx";',
+              '\tresets = <&clk 0x28 0>;',
+              '\treset-names = "stmmaceth";',
+              '\tphy-mode = "mii";',
+              '\tphy-handle = <&ethphy>;',
+              '\tmdio {',
+              '\t\t#address-cells = <1>;',
+              '\t\t#size-cells = <0>;',
+              '\t\tcompatible = "snps,dwmac-mdio";',
+              '\t\tethphy: ethernet-phy@0 {',
+              '\t\t\treg = <0>;',
+              '\t\t};',
+              '\t};',
+              '};',
+              '',
+              '&usb0 {',
+              '\tphys = <&usb2_phy>;',
+              '\tphy-names = "usb2-phy";',
+              '\tclocks = <&clk 0x18>;',
+              '\tresets = <&clk 0x14 0>;',
+              '};',
+              '',
+              '&usb1 {',
+              '\tphys = <&usb2_phy>;',
+              '\tphy-names = "usb2-phy";',
+              '\tclocks = <&clk 0x19>;',
+              '\tresets = <&clk 0x15 0>;',
+              '};',
+              '',
+              '&i2c0 {',
+              '\tclocks = <&clk 0x40>;',
+              '\tresets = <&clk 0x30 0>;',
+              '};',
+              '',
+              '&sdhci0 {',
+              '\tclocks = <&clk 0x50>, <&clk 0x51>;',
+              '\tclock-names = "biu", "ciu";',
+              '\tresets = <&clk 0x48 0>;',
+              '};',
+          ]
+          dts.write_text(t + '\n' + '\n'.join(p) + '\n')
+          print('已补全所有硬件节点')
+          PY
+          python3 patch_dts.py
+          echo "=== DTS节点校验 ==="
+          for k in "clock-controller@f8a22000" "usb-phy@f98c0000" "ethernet-phy@0"; do
+            if grep -q "$k" "../$BOARD_DTS"; then
+              echo "OK   $k"
+            else
+              echo "::error::dts 缺少 $k 节点，外设无法初始化"
+              exit 1
+            fi
+          done
 
       - name: 部署内核配置并强制关键驱动内置
         run: |
@@ -390,6 +490,8 @@ jobs:
           # ★ PHY_HISI_INNO_USB2 的父符号
           scripts/config --enable GENERIC_PHY
           scripts/config --enable USB_PHY
+          scripts/config --enable RESET_CONTROLLER
+          scripts/config --enable RESET_HISI
           scripts/config --enable USB_EHCI_HCD
           scripts/config --enable USB_EHCI_HCD_PLATFORM
           scripts/config --enable USB_OHCI_HCD
@@ -397,9 +499,11 @@ jobs:
           scripts/config --enable PHY_HISI_INNO_USB2
           scripts/config --enable USB_STORAGE
           # ALSA 骨架：SND_PCM / SND_TIMER 是**无 prompt 符号**，取值只由 select 决定，
-          # 在这里 --enable 也会被 olddefconfig 重算，故不写（见 gk6323v100c.config 附录）。
-          # ★ 本仓库存在的理由：USB 声卡 / USB DAC
+          # 在这里 --enable 也会被 olddefconfig 重算，故不写（见 kernel.config 附录）。
+          # ★ 本仓库存在的理由：USB 声卡 / USB DAC + 内置ES8316声卡
           scripts/config --enable SND_USB
+          scripts/config --enable SND_SOC
+          scripts/config --enable SND_SOC_ES8316
           # ★ 这里必须用 --module，不能用 --enable：--enable 对 tristate 符号等于设成 y，
           #   会顶掉叠加层里的 =m，把 USB 音频编成内置，产物形态就不再是「内核 + 模块」，
           #   逐行自检还会报「叠加层未生效：CONFIG_SND_USB_AUDIO=m」。SND_USB 是 bool，用 --enable 正确。
@@ -407,7 +511,7 @@ jobs:
           # 模块支持：作者那版是纯内置内核（/proc/modules 不存在）
           scripts/config --enable MODULES
           scripts/config --enable MODULE_UNLOAD
-          # 启动参数不再在这里置空：gk6323v100c.config 叠加层里已带上完整的
+          # 启动参数不再在这里置空：kernel.config 叠加层里已带上完整的
           # CONFIG_CMDLINE 与 CONFIG_CMDLINE_FORCE=y（理由见该文件对应段落）。
           # ★ 这里原本是 `scripts/config --set-str CMDLINE ""`。本步骤在 merge 之后
           #   执行，保留它会把叠加层那行长命令行又清成空串，earlycon 随之消失 ——
@@ -422,7 +526,8 @@ jobs:
                    MMC_BLOCK MMC_DW_PLTFM \
                    EXT4_FS PARTITION_ADVANCED CMDLINE_PARTITION \
                    NET_VENDOR_HISILICON PHYLIB HISI_FEMAC \
-                   USB_EHCI_HCD PHY_HISI_INNO_USB2 MODULES; do
+                   RESET_CONTROLLER RESET_HISI GENERIC_PHY PHY_HISI_INNO_USB2 \
+                   USB_EHCI_HCD USB_OHCI_HCD MODULES; do
             if grep -qE "^CONFIG_${s}=[ym]$" .config; then
               echo "OK   $(grep -E "^CONFIG_${s}=" .config)"
             else
@@ -876,12 +981,6 @@ jobs:
           path: linux_build/out/*
 
       - name: 生成发布说明
-        env:
-          PATCHES_KERNEL_VERSION: ${{ env.PATCHES_KERNEL_VERSION }}
-          TARGET_DTB: ${{ env.TARGET_DTB }}
-          UIMAGE_LOADADDR: ${{ env.UIMAGE_LOADADDR }}
-          BOOT_PART: ${{ env.BOOT_PART }}
-          DTBO_PART: ${{ env.DTBO_PART }}
         run: |
             set -euo pipefail
             cd linux_build/out
@@ -898,7 +997,7 @@ jobs:
             - 内核基线：Linux @KREL@（与 hi3798mv100 仓库同一 pin），按补丁库 baseline 提取工作树
             - 补丁来源：histb-mainline_patches，严格应用（等价 --fuzz=0），冲突即回滚
             - 设备树：@TARGET_DTB@，逐项取自真机导出的设备树（A55 / GICv3 / 国科专有 IP 全部对齐）
-            - 内核配置：仓库 gk6323v100c.config；串口、eMMC、ext4、命令行分区表均编入内核（=y）
+            - 内核配置：仓库 kernel.config；串口、eMMC、ext4、命令行分区表均编入内核（=y）
             - 关键项：CONFIG_SND_USB_AUDIO —— 作者那版 BSP 内核没有编入，USB 声卡因此不出声
             - 该驱动形态与 mv100 的 kernel.config 一致（=m），所以必须先把模块解开再重启
             - 模块支持：CONFIG_MODULES=y，作者那版是纯内置内核（/proc/modules 不存在）
