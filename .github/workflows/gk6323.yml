@@ -31,7 +31,9 @@ name: GK6323V100C 内核自动构建
 #   c) 真机运行的设备树来自 dtbo 分区（作者 boot.img 内没有 dtb）。因此
 #      编译出的 dtb **必须写入 dtbo 分区**才能生效；内嵌的那份是冗余备份。
 #      注意：legacy uImage 的 bootm 不会解析「追加在 Image 末尾的 dtb」，
-#      要让内核拿到设备树，必须 `bootm <kernel> - <fdt>` 显式传第三个参数。
+#      本机 bootcmd 是 `bootm 0x04000000`（不带第三个 fdt 参数），内核拿不到有效
+#      fdt —— 已由下面「给内核打 dtb 兜底补丁」一步在 primary_entry 处兜底改用
+#      0x03FFC000 处的设备树，**不需要**手动传第三个参数。
 #
 # 纪律（踩过坑，勿犯）：
 #   set -euo pipefail 之下，任何「赋值 + 管道」都必须兜底。写成
@@ -107,11 +109,11 @@ jobs:
       - name: 校验必要文件存在
         run: |
           set -euo pipefail
-          for f in apply_histb_patches.sh "$FRAGMENT" "$BOARD_DTS"; do
+          for f in apply_histb_patches.sh "$FRAGMENT" slim.config "$BOARD_DTS" dts/check-dts.py; do
             [ -f "$f" ] || { echo "::error::根目录缺少 $f"; exit 1; }
           done
           chmod +x apply_histb_patches.sh
-          ls -lh apply_histb_patches.sh "$FRAGMENT" "$BOARD_DTS"
+          ls -lh apply_histb_patches.sh "$FRAGMENT" slim.config "$BOARD_DTS" dts/check-dts.py
 
       - name: 工作流静态自检（防 set -e + pipefail 下的裸管道赋值）
         run: |
@@ -246,6 +248,7 @@ jobs:
           code = ''.join([
               '\t/* GK6323_DTB_FALLBACK: use the dtb at 0x03FFC000 when x0 is not an fdt */\n',
               '\tldr\tw20, [x0]\n',
+              '\trev\tw20, w20\n',
               '\tmovz\tw21, #0xfeed\n',
               '\tmovk\tw21, #0xd00d, lsl #16\n',
               '\tcmp\tw20, w21\n',
@@ -397,7 +400,7 @@ jobs:
           scripts/config --enable PHY_HISI_INNO_USB2
           scripts/config --enable USB_STORAGE
           # ALSA 骨架：SND_PCM / SND_TIMER 是**无 prompt 符号**，取值只由 select 决定，
-          # 在这里 --enable 也会被 olddefconfig 重算，故不写（见 gk6323v100c.config 附录）。
+          # 在这里 --enable 也会被 olddefconfig 重算，故不写（见 kernel.config 附录）。
           # ★ 本仓库存在的理由：USB 声卡 / USB DAC
           scripts/config --enable SND_USB
           # ★ 这里必须用 --module，不能用 --enable：--enable 对 tristate 符号等于设成 y，
@@ -407,7 +410,7 @@ jobs:
           # 模块支持：作者那版是纯内置内核（/proc/modules 不存在）
           scripts/config --enable MODULES
           scripts/config --enable MODULE_UNLOAD
-          # 启动参数不再在这里置空：gk6323v100c.config 叠加层里已带上完整的
+          # 启动参数不再在这里置空：kernel.config 叠加层里已带上完整的
           # CONFIG_CMDLINE 与 CONFIG_CMDLINE_FORCE=y（理由见该文件对应段落）。
           # ★ 这里原本是 `scripts/config --set-str CMDLINE ""`。本步骤在 merge 之后
           #   执行，保留它会把叠加层那行长命令行又清成空串，earlycon 随之消失 ——
@@ -876,12 +879,6 @@ jobs:
           path: linux_build/out/*
 
       - name: 生成发布说明
-        env:
-          PATCHES_KERNEL_VERSION: ${{ env.PATCHES_KERNEL_VERSION }}
-          TARGET_DTB: ${{ env.TARGET_DTB }}
-          UIMAGE_LOADADDR: ${{ env.UIMAGE_LOADADDR }}
-          BOOT_PART: ${{ env.BOOT_PART }}
-          DTBO_PART: ${{ env.DTBO_PART }}
         run: |
             set -euo pipefail
             cd linux_build/out
@@ -898,7 +895,7 @@ jobs:
             - 内核基线：Linux @KREL@（与 hi3798mv100 仓库同一 pin），按补丁库 baseline 提取工作树
             - 补丁来源：histb-mainline_patches，严格应用（等价 --fuzz=0），冲突即回滚
             - 设备树：@TARGET_DTB@，逐项取自真机导出的设备树（A55 / GICv3 / 国科专有 IP 全部对齐）
-            - 内核配置：仓库 gk6323v100c.config；串口、eMMC、ext4、命令行分区表均编入内核（=y）
+            - 内核配置：仓库 kernel.config；串口、eMMC、ext4、命令行分区表均编入内核（=y）
             - 关键项：CONFIG_SND_USB_AUDIO —— 作者那版 BSP 内核没有编入，USB 声卡因此不出声
             - 该驱动形态与 mv100 的 kernel.config 一致（=m），所以必须先把模块解开再重启
             - 模块支持：CONFIG_MODULES=y，作者那版是纯内置内核（/proc/modules 不存在）
