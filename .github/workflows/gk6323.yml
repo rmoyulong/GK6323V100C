@@ -48,7 +48,7 @@ on:
     branches: [ master, main ]
     paths:
       - '.github/workflows/gk6323.yml'
-      - 'gk6323v100c.config'
+      - 'kernel.config'
       - 'slim.config'
       - 'apply_histb_patches.sh'
       - 'dts/*.dts'
