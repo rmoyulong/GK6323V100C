@@ -256,14 +256,17 @@ jobs:
               # Kconfig，导致 kconfig 解析报错（构建在 scripts/kconfig 阶段直接失败）。
               printf '\n'
               printf 'config COMMON_CLK_GK6323V100C\n'
-              printf '\ttristate "Clock driver for GK6323V100C CRG"\n'
+              # bool 而不是 tristate：本驱动必须在启动早期（arch_initcall_sync）
+              # 就把门控写开，编成模块会晚于外设 probe，没有意义。
+              printf '\tbool "GK6323V100C CRG gate/reset preset driver"\n'
               printf '\tdepends on COMMON_CLK\n'
               printf '\tdepends on HAS_IOMEM\n'
               printf '\tdepends on RESET_CONTROLLER\n'
               printf '\thelp\n'
-              printf '\t  Minimal clock and reset driver for GK6323V100C CRG.\n'
-              printf '\t  Registers gate clocks and resets for eMMC/USB2/FEMAC;\n'
-              printf '\t  other PLLs/peripherals are left to U-Boot.\n'
+              printf '\t  Gate on and release the eMMC/USB2/FEMAC clocks and resets\n'
+              printf '\t  of the GK6323V100C CRG, and expose a two-cell\n'
+              printf '\t  (offset, bit) reset controller.  No clock provider is\n'
+              printf '\t  registered; PLLs are left as U-Boot set them.\n'
             } >> "$KC"
             echo "OK 已向 Kconfig 追加 COMMON_CLK_GK6323V100C"
           fi

@@ -1,156 +1,213 @@
-From 599e11c70c40bc0fdbac5d6fd7a1188ce4c0e09d Mon Sep 17 00:00:00 2001
-From: GK6323 Mainline Port <mainline@gk6323.local>
-Date: Sat, 21 Nov 2026 01:20:12 +0800
-Subject: [PATCH] clk: hisilicon: add GK6323V100C minimal CRG driver source and
- headers
+From 517199d14cf62bffcc042f299030eb2de8f47093 Mon Sep 17 00:00:00 2001
+From: build <b@local>
+Date: Sat, 21 Nov 2026 02:04:47 +0800
+Subject: [PATCH] clk: hisilicon: add the GK6323V100C CRG gate/reset preset
+ driver
 
 ---
- drivers/clk/hisilicon/crg-gk6323v100c.c       | 236 ++++++++++++++++++
- include/dt-bindings/clock/gk6323v100c-crg.h   |  26 ++
- .../dt-bindings/reset/gk6323v100c-resets.h    |  24 ++
- 3 files changed, 286 insertions(+)
+ drivers/clk/hisilicon/crg-gk6323v100c.c | 275 ++++++++++++++++++++++++
+ 1 file changed, 275 insertions(+)
  create mode 100644 drivers/clk/hisilicon/crg-gk6323v100c.c
- create mode 100644 include/dt-bindings/clock/gk6323v100c-crg.h
- create mode 100644 include/dt-bindings/reset/gk6323v100c-resets.h
 
 diff --git a/drivers/clk/hisilicon/crg-gk6323v100c.c b/drivers/clk/hisilicon/crg-gk6323v100c.c
 new file mode 100644
-index 0000000..d8020dd
+index 0000000..3a20ae2
 --- /dev/null
 +++ b/drivers/clk/hisilicon/crg-gk6323v100c.c
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,275 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
-+ * GK6323V100C minimal CRG (Clock/Reset Generator) driver
++ * GK6323V100C（国科微）CRG 门控/复位预置驱动
 + *
-+ * 仅注册已通过原厂设备树 + BSP 源码交叉验证的 3 组外设门控与复位：
-+ *   - eMMC (dw-mmc):       PERI_CRG40 @ 0x0a0, reset bit 4
-+ *   - USB2 EHCI/OHCI:      PERI_CRG46 @ 0x0b8, reset bits 12/13/14
-+ *                          PERI_CRG47 @ 0x0bc, PHY reset bits 4/8/9
-+ *   - FEMAC ethernet:      PERI_CRG51 @ 0x0cc (BUS), PERI_CRG52 @ 0x0d0 (IF),
-+ *                          reset bit 0 (bus), bit 1 (MACIF)
++ * 只做两件在真机上必须做的事，不做别的：
 + *
-+ * 刻意不注册：PLL、I2C、IR、SPI、AIAO、VDM/GPU 等未在当前主线 dts 中
-+ * 验证的门控，避免误写寄存器导致系统挂死。PLL 全部保持 U-Boot 设好的状态。
++ *   1) 把 eMMC / USB2 / FEMAC 三组外设的时钟门控位直接写开，
++ *      并把它们的软复位位释放掉（真机上这些外设挂在 CRG 的门控下面，
++ *      U-Boot 交棒时没开，内核里也没有 CRU 驱动，所以网卡/U 口全部
++ *      probe 失败：MDIO 报 -5、EHCI 报 -110、OHCI 报 -75）；
 + *
-+ * 基地址来自原厂设备树：f8a22000（与原厂 TTL 打印一致）
++ *   2) 注册一个「2 个 cell = (寄存器偏移, 位号)」的复位控制器，使设备树
++ *      可以写成
++ *          resets = <&cru 0xd0 3>;
++ *          reset-names = "mac";
++ *      真机实测 hisi_femac 驱动对 "mac" 复位是强制要求，没有它 probe
++ *      直接失败并返回 -ENOENT（就是日志里那条 error -2）。
 + *
-+ * 初始化时机：arch_initcall_sync，控制台已建好，probe 出错 dmesg 可见，
-+ *            不会像 CLK_OF_DECLARE 那样在控制台建立前把时钟树写乱导致花屏。
++ * 为什么不注册时钟 provider：
++ *   外设在设备树里继续用 fixed-clock（能启动的那一版就是这么写的）。
++ *   一旦注册了时钟 provider 而它因任何原因没绑上（比如父时钟名对不上），
++ *   所有引用 <&cru N> 的外设会永久 -EPROBE_DEFER，连挂着根文件系统的
++ *   eMMC 一起拖死，表现为起不来 / 花屏。门控改由本驱动直接写寄存器，
++ *   效果一样而失败面小得多：这个驱动挂不上，最多是网卡和 U 口不动，
++ *   eMMC 照常启动。
++ *
++ * 偏移 / 位号的来源（逐条有据，不是猜的）：
++ *   - 门控位取自补丁库 510-02（Hi3798MV200 CRG 驱动）的门控表：
++ *       eMMC   0xa0 bit0=biu / bit1=ciu
++ *       USB2   0xb8 bit0=bus / bit1=48M / bit2=12M / bit4=hst_phy
++ *              bit5=utmi0 / bit6=utmi1；0xbc bit0=PHY1 参考时钟
++ *       FEMAC  0xd0 bit0=bus / bit1=mac；0x388 bit0=fephy
++ *     该表还特意注明：CRG51/CRG52 的「时钟使能位」与「软复位请求位」
++ *     是成对分开的两组位（例如 CRG51 使能在 bit1/bit3，复位请求在
++ *     bit0/bit2），所以使能与复位绝不能写成同一个位。
++ *   - 复位位取自补丁库 815-02（Hi3798MV200 SoC dtsi）各节点 resets 单元：
++ *       eMMC <0xa0 4>；EHCI <0xb8 12/13/14/16>；OHCI <0xb8 12>
++ *       USB2 PHY <0xbc 4>；端口 0/1 <0xbc 8/9>；FEMAC mac <0xd0 3>
++ *   - 基址 f8a22000：真机原厂 TTL 打印 "gk6323v100c-cru f8a22000.clock"，
++ *     与反编译出的原厂设备树 clock@f8a22000 完全一致。
++ *
++ * 初始化时机：arch_initcall_sync 注册 platform 驱动，probe 时控制台已经
++ * 建好，出错会正常出现在 dmesg 里；不像早期时钟初始化（CLK_OF_DECLARE）
++ * 那样在控制台建立之前就动时钟树，一旦位号不对连 panic 都打不出来。
 + */
 +
-+#include <linux/clk-provider.h>
++#include <linux/bits.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/gfp.h>
 +#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
 +#include <linux/module.h>
 +#include <linux/of.h>
 +#include <linux/platform_device.h>
 +#include <linux/reset-controller.h>
-+#include <linux/regmap.h>
-+#include <linux/mfd/syscon.h>
-+#include <dt-bindings/clock/gk6323v100c-crg.h>
-+#include <dt-bindings/reset/gk6323v100c-resets.h>
++#include <linux/spinlock.h>
 +
-+/* 每组门控时钟描述：名字、父时钟、寄存器偏移、门控位、状态标志 */
-+struct gk_gate_clock {
-+	const char *name;
-+	const char *parent_name;
-+	u32 reg_offset;
-+	u8 gate_bit;
-+	unsigned long flags;
-+};
++/* CRG 窗口大小：原厂设备树 clock@f8a22000 的 reg 长度就是 0x400 */
++#define GK_CRG_MAP_SIZE		0x400
 +
 +/*
-+ * 时钟 ID 定义见 include/dt-bindings/clock/gk6323v100c-crg.h
-+ * 顺序与头文件中宏顺序严格对应
++ * 复位 ID = (寄存器偏移 << 5) | 位号。
++ * 设备树里写成两个 cell：resets = <&cru 0xd0 3>; 即偏移 0xd0 的 bit3。
 + */
-+static const struct gk_gate_clock gk_crg_clks[] = {
-+	/* eMMC — PERI_CRG40 @ 0xa0 */
-+	[GK6323_CLK_MCI_BUS]   = { "mci0_bus",    "osc24m", 0xa0, 0, CLK_SET_RATE_PARENT },
-+	[GK6323_CLK_MCI_CIU]   = { "mci0_ciu",    "osc24m", 0xa0, 1, CLK_SET_RATE_PARENT },
++#define GK_CRG_RESET_ID(off, bit)	(((off) << 5) | ((bit) & 0x1f))
++#define GK_CRG_RESET_OFF(id)		((id) >> 5)
++#define GK_CRG_RESET_BIT(id)		((id) & 0x1f)
++#define GK_CRG_NR_RESETS		(GK_CRG_MAP_SIZE << 5)
 +
-+	/* USB2 — PERI_CRG46 @ 0xb8 */
-+	[GK6323_CLK_USB2_BUS]   = { "usb2_bus",    "osc24m", 0xb8, 0, 0 },
-+	[GK6323_CLK_USB2_OHCI]  = { "usb2_ohci",   "osc24m", 0xb8, 1, 0 },
-+	[GK6323_CLK_USB2_HSTPHY]= { "usb2_hstphy", "osc24m", 0xb8, 4, 0 },
-+	[GK6323_CLK_USB2_UTMI0] = { "usb2_utmi0",  "osc24m", 0xb8, 5, 0 },
-+	/* USB2 PHY 参考时钟 PERI_CRG47 @ 0xbc */
-+	[GK6323_CLK_USB2_PHY_REF] = { "usb2_phy_ref","osc24m", 0xbc, 0, 0 },
-+
-+	/* FEMAC 以太网 — PERI_CRG51/52 */
-+	[GK6323_CLK_FEMAC_BUS]  = { "femac_bus", "osc24m", 0xcc, 0, 0 },
-+	[GK6323_CLK_FEMAC_IF]   = { "femac_if",  "osc24m", 0xd0, 0, CLK_SET_RATE_PARENT },
++/* 一个 (偏移, 位号) 对，门控开位与复位清位都用它 */
++struct gk_crg_bit {
++	u16 offset;
++	u8 bit;
 +};
 +
-+#define GK_CRG_NR_CLKS		ARRAY_SIZE(gk_crg_clks)
++/* 需要打开的时钟门控（写 1 = 使能） */
++static const struct gk_crg_bit gk_crg_gates[] = {
++	/* eMMC：PERI_CRG40 @ 0xa0 */
++	{ 0xa0, 0 },	/* clk_mmc_biu */
++	{ 0xa0, 1 },	/* clk_mmc_ciu */
 +
-+/* 复位控制：每个复位 = 寄存器偏移 + 位号（写1置位，写0释放） */
-+struct gk_reset_desc {
-+	u32 reg_offset;
-+	u8 reset_bit;
++	/* USB2：PERI_CRG46 @ 0xb8 */
++	{ 0xb8, 0 },	/* clk_u2_bus */
++	{ 0xb8, 1 },	/* clk_u2_48m */
++	{ 0xb8, 2 },	/* clk_u2_12m */
++	{ 0xb8, 4 },	/* clk_u2_phy（HST PHY 60M） */
++	{ 0xb8, 5 },	/* clk_u2_utmi0 */
++	{ 0xb8, 6 },	/* clk_u2_utmi1 */
++	/* USB2 PHY1 参考时钟：PERI_CRG47 @ 0xbc —— 原厂 dtsi 注明 bit0 一个门
++	 * 就覆盖两个 host 端口
++	 */
++	{ 0xbc, 0 },	/* clk_u2_phy1_ref */
++
++	/* FEMAC：PERI_CRG51/52 @ 0xd0，内部 PHY 的 FEPHY 门在 0x388 */
++	{ 0xd0, 0 },	/* clk_femacif（bus） */
++	{ 0xd0, 1 },	/* clk_femac */
++	{ 0x388, 0 },	/* clk_fephy */
 +};
 +
-+/* 复位 ID 定义见 include/dt-bindings/reset/gk6323v100c-resets.h */
-+static const struct gk_reset_desc gk_crg_resets[] = {
-+	/* eMMC 软复位: PERI_CRG40 @ 0xa0 bit 4 */
-+	[GK6323_RST_MCI0]        = { 0xa0, 4 },
-+
-+	/* USB2: PERI_CRG46 bit12=HOST, bit13=UTMI0; PERI_CRG47 bit4=PHY APB, bit8=PORT0 */
-+	[GK6323_RST_USB2_HST]    = { 0xb8, 12 },
-+	[GK6323_RST_USB2_UTMI0]  = { 0xb8, 13 },
-+	[GK6323_RST_USB2_PHY]    = { 0xbc, 4  },
-+	[GK6323_RST_USB2_PORT0]  = { 0xbc, 8  },
-+
-+	/* FEMAC: PERI_CRG51 bit0=BUS, PERI_CRG52 bit1=MACIF */
-+	[GK6323_RST_FEMAC_BUS]   = { 0xcc, 0 },
-+	[GK6323_RST_FEMAC_MACIF] = { 0xd0, 1 },
++/* 需要在 probe 时先释放掉的软复位（写 0 = 释放） */
++static const struct gk_crg_bit gk_crg_release[] = {
++	{ 0xa0, 4 },	/* eMMC 软复位 */
++	{ 0xb8, 12 },	/* USB2 主控软复位 */
++	{ 0xb8, 13 },	/* USB2 UTMI0 */
++	{ 0xb8, 14 },	/* USB2 UTMI1 */
++	{ 0xb8, 16 },	/* USB2 端口 */
++	{ 0xbc, 4 },	/* USB2 PHY APB */
++	{ 0xbc, 8 },	/* USB2 端口 0 */
++	{ 0xbc, 9 },	/* USB2 端口 1 */
++	{ 0xd0, 3 },	/* FEMAC mac 软复位 */
 +};
-+
-+#define GK_CRG_NR_RESETS	ARRAY_SIZE(gk_crg_resets)
 +
 +struct gk_crg_priv {
-+	struct regmap			*regmap;
-+	struct clk_hw_onecell_data	clk_data;
++	void __iomem			*base;
++	spinlock_t			lock;
 +	struct reset_controller_dev	rcdev;
 +};
 +
-+static inline struct gk_crg_priv *rcdev_to_priv(struct reset_controller_dev *rcdev)
++static inline struct gk_crg_priv *gk_crg_from_rcdev(struct reset_controller_dev *rcdev)
 +{
 +	return container_of(rcdev, struct gk_crg_priv, rcdev);
 +}
 +
-+static int gk_crg_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
++static void gk_crg_write_bits(struct gk_crg_priv *priv, u16 offset, u8 bit,
++			      bool set)
 +{
-+	struct gk_crg_priv *priv = rcdev_to_priv(rcdev);
-+	const struct gk_reset_desc *rst;
++	unsigned long flags;
++	u32 val;
++
++	spin_lock_irqsave(&priv->lock, flags);
++	val = readl(priv->base + offset);
++	if (set)
++		val |= BIT(bit);
++	else
++		val &= ~BIT(bit);
++	writel(val, priv->base + offset);
++	spin_unlock_irqrestore(&priv->lock, flags);
++}
++
++/*
++ * 复位控制器：2 个 cell（偏移, 位号）。
++ * 用自定义 of_xlate 而不是默认的 of_reset_simple_xlate —— 后者把 cell[0]
++ * 直接当 ID 用，装不下「偏移 + 位号」两个信息。
++ */
++static int gk_crg_of_xlate(struct reset_controller_dev *rcdev,
++			   const struct of_phandle_args *spec)
++{
++	if (spec->args_count != 2)
++		return -EINVAL;
++	if (spec->args[0] >= GK_CRG_MAP_SIZE || spec->args[1] > 31)
++		return -EINVAL;
++
++	return GK_CRG_RESET_ID(spec->args[0], spec->args[1]);
++}
++
++static int gk_crg_reset_set(struct reset_controller_dev *rcdev, unsigned long id,
++			    bool assert)
++{
++	struct gk_crg_priv *priv = gk_crg_from_rcdev(rcdev);
 +
 +	if (id >= GK_CRG_NR_RESETS)
 +		return -EINVAL;
-+	rst = &gk_crg_resets[id];
-+	return regmap_set_bits(priv->regmap, rst->reg_offset, BIT(rst->reset_bit));
++
++	gk_crg_write_bits(priv, GK_CRG_RESET_OFF(id), GK_CRG_RESET_BIT(id),
++			  assert);
++	return 0;
 +}
 +
-+static int gk_crg_reset_deassert(struct reset_controller_dev *rcdev, unsigned long id)
++static int gk_crg_reset_assert(struct reset_controller_dev *rcdev,
++			       unsigned long id)
 +{
-+	struct gk_crg_priv *priv = rcdev_to_priv(rcdev);
-+	const struct gk_reset_desc *rst;
-+
-+	if (id >= GK_CRG_NR_RESETS)
-+		return -EINVAL;
-+	rst = &gk_crg_resets[id];
-+	return regmap_clear_bits(priv->regmap, rst->reg_offset, BIT(rst->reset_bit));
++	return gk_crg_reset_set(rcdev, id, true);
 +}
 +
-+static int gk_crg_reset_status(struct reset_controller_dev *rcdev, unsigned long id)
++static int gk_crg_reset_deassert(struct reset_controller_dev *rcdev,
++				 unsigned long id)
 +{
-+	struct gk_crg_priv *priv = rcdev_to_priv(rcdev);
-+	const struct gk_reset_desc *rst;
++	return gk_crg_reset_set(rcdev, id, false);
++}
++
++static int gk_crg_reset_status(struct reset_controller_dev *rcdev,
++			       unsigned long id)
++{
++	struct gk_crg_priv *priv = gk_crg_from_rcdev(rcdev);
 +	u32 val;
 +
 +	if (id >= GK_CRG_NR_RESETS)
 +		return -EINVAL;
-+	rst = &gk_crg_resets[id];
-+	regmap_read(priv->regmap, rst->reg_offset, &val);
-+	return !!(val & BIT(rst->reset_bit));
++
++	val = readl(priv->base + GK_CRG_RESET_OFF(id));
++	return !!(val & BIT(GK_CRG_RESET_BIT(id)));
 +}
 +
 +static const struct reset_control_ops gk_crg_reset_ops = {
@@ -162,68 +219,46 @@ index 0000000..d8020dd
 +static int gk_crg_probe(struct platform_device *pdev)
 +{
 +	struct device *dev = &pdev->dev;
-+	struct device_node *np = dev->of_node;
 +	struct gk_crg_priv *priv;
-+	struct regmap *regmap;
 +	void __iomem *base;
-+	unsigned int i;
++	size_t i;
 +	int ret;
 +
-+	regmap = syscon_node_to_regmap(np);
-+	if (IS_ERR(regmap)) {
-+		base = devm_platform_ioremap_resource(pdev, 0);
-+		if (IS_ERR(base))
-+			return PTR_ERR(base);
-+		regmap = devm_regmap_init_mmio(dev, base,
-+			&(struct regmap_config){
-+				.reg_bits = 32, .val_bits = 32,
-+				.reg_stride = 4, .max_register = 0x200,
-+				.name = "gk6323-crg",
-+			});
-+		if (IS_ERR(regmap))
-+			return PTR_ERR(regmap);
-+	}
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return dev_err_probe(dev, PTR_ERR(base), "CRG 寄存器映射失败\n");
 +
-+	priv = devm_kzalloc(dev, struct_size(priv, clk_data.hws, GK_CRG_NR_CLKS), GFP_KERNEL);
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 +	if (!priv)
 +		return -ENOMEM;
-+	priv->regmap = regmap;
 +
-+	for (i = 0; i < GK_CRG_NR_CLKS; i++) {
-+		const struct gk_gate_clock *gc = &gk_crg_clks[i];
-+		struct clk_hw *hw;
++	priv->base = base;
++	spin_lock_init(&priv->lock);
 +
-+		hw = devm_clk_hw_register_gate(dev, gc->name, gc->parent_name, gc->flags,
-+					       regmap, gc->reg_offset, gc->gate_bit,
-+					       0, NULL);
-+		if (IS_ERR(hw)) {
-+			dev_err(dev, "failed to register clock %s: %ld\n",
-+				gc->name, PTR_ERR(hw));
-+			return PTR_ERR(hw);
-+		}
-+		priv->clk_data.hws[i] = hw;
-+	}
-+	priv->clk_data.num = GK_CRG_NR_CLKS;
++	/* 1) 直接把三组外设的门控写开、复位放开，不依赖任何消费者 */
++	for (i = 0; i < ARRAY_SIZE(gk_crg_gates); i++)
++		gk_crg_write_bits(priv, gk_crg_gates[i].offset,
++				  gk_crg_gates[i].bit, true);
 +
-+	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, &priv->clk_data);
-+	if (ret) {
-+		dev_err(dev, "failed to add clock provider: %d\n", ret);
-+		return ret;
-+	}
++	for (i = 0; i < ARRAY_SIZE(gk_crg_release); i++)
++		gk_crg_write_bits(priv, gk_crg_release[i].offset,
++				  gk_crg_release[i].bit, false);
 +
++	/* 2) 把复位控制器暴露出去，让设备树里的 resets = <&cru off bit> 能解析 */
 +	priv->rcdev.ops = &gk_crg_reset_ops;
 +	priv->rcdev.owner = THIS_MODULE;
++	priv->rcdev.of_node = dev->of_node;
 +	priv->rcdev.nr_resets = GK_CRG_NR_RESETS;
-+	priv->rcdev.of_node = np;
++	priv->rcdev.of_reset_n_cells = 2;
++	priv->rcdev.of_xlate = gk_crg_of_xlate;
 +
 +	ret = devm_reset_controller_register(dev, &priv->rcdev);
-+	if (ret) {
-+		dev_err(dev, "failed to register reset controller: %d\n", ret);
-+		return ret;
-+	}
++	if (ret)
++		return dev_err_probe(dev, ret, "复位控制器注册失败\n");
 +
-+	dev_info(dev, "GK6323V100C CRG: registered %u gate clocks, %u resets\n",
-+		 GK_CRG_NR_CLKS, GK_CRG_NR_RESETS);
++	dev_info(dev,
++		 "GK6323V100C CRG: %zu gates enabled, %zu resets released, reset cells = 2\n",
++		 ARRAY_SIZE(gk_crg_gates), ARRAY_SIZE(gk_crg_release));
 +	return 0;
 +}
 +
@@ -253,67 +288,8 @@ index 0000000..d8020dd
 +}
 +module_exit(gk_crg_exit);
 +
-+MODULE_DESCRIPTION("GK6323V100C minimal CRG clock/reset driver");
-+MODULE_LICENSE("GPL v2");
-diff --git a/include/dt-bindings/clock/gk6323v100c-crg.h b/include/dt-bindings/clock/gk6323v100c-crg.h
-new file mode 100644
-index 0000000..6d2662d
---- /dev/null
-+++ b/include/dt-bindings/clock/gk6323v100c-crg.h
-@@ -0,0 +1,26 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+/*
-+ * GK6323V100C CRG clock IDs
-+ * 仅列出本最小驱动中实际注册的时钟；其他时钟暂不启用，避免误写寄存器。
-+ */
-+#ifndef __DT_BINDINGS_CLOCK_GK6323V100C_CRG_H
-+#define __DT_BINDINGS_CLOCK_GK6323V100C_CRG_H
-+
-+/* eMMC — PERI_CRG40 */
-+#define GK6323_CLK_MCI_BUS		0
-+#define GK6323_CLK_MCI_CIU		1
-+
-+/* USB2 — PERI_CRG46 / 47 */
-+#define GK6323_CLK_USB2_BUS		2
-+#define GK6323_CLK_USB2_OHCI		3
-+#define GK6323_CLK_USB2_HSTPHY		4
-+#define GK6323_CLK_USB2_UTMI0		5
-+#define GK6323_CLK_USB2_PHY_REF		6
-+
-+/* FEMAC 以太网 — PERI_CRG51 / 52 */
-+#define GK6323_CLK_FEMAC_BUS		7
-+#define GK6323_CLK_FEMAC_IF		8
-+
-+#define GK6323_CLK_CRGC_NR		9
-+
-+#endif
-diff --git a/include/dt-bindings/reset/gk6323v100c-resets.h b/include/dt-bindings/reset/gk6323v100c-resets.h
-new file mode 100644
-index 0000000..0d0c4b2
---- /dev/null
-+++ b/include/dt-bindings/reset/gk6323v100c-resets.h
-@@ -0,0 +1,24 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+/*
-+ * GK6323V100C CRG reset IDs
-+ * 仅列出本最小驱动中实际注册的复位线。
-+ */
-+#ifndef __DT_BINDINGS_RESET_GK6323V100C_RESETS_H
-+#define __DT_BINDINGS_RESET_GK6323V100C_RESETS_H
-+
-+/* eMMC */
-+#define GK6323_RST_MCI0			0
-+
-+/* USB2 */
-+#define GK6323_RST_USB2_HST		1
-+#define GK6323_RST_USB2_UTMI0		2
-+#define GK6323_RST_USB2_PHY		3
-+#define GK6323_RST_USB2_PORT0		4
-+
-+/* FEMAC */
-+#define GK6323_RST_FEMAC_BUS		5
-+#define GK6323_RST_FEMAC_MACIF		6
-+
-+#define GK6323_RST_CRGC_NR		7
-+
-+#endif
++MODULE_DESCRIPTION("GK6323V100C CRG gate/reset preset driver");
++MODULE_LICENSE("GPL");
+-- 
+2.34.1
+
