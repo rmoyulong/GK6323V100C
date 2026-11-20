@@ -14,7 +14,7 @@
 <Part Sel="0" PartitionName="logobak" FlashType="emmc" FileSystem="none" Start="62M" Length="10M" SelectFile="logobak.img"/>
 <Part Sel="0" PartitionName="fastplay" FlashType="emmc" FileSystem="none" Start="72M" Length="20M" SelectFile="fastplay.img"/>
 <Part Sel="0" PartitionName="recoverybak" FlashType="emmc" FileSystem="none" Start="92M" Length="20M" SelectFile="recoverybak.img"/>
-<Part Sel="1" PartitionName="boot" FlashType="emmc" FileSystem="none" Start="112M" Length="60M" SelectFile="boot.img"/>
+<Part Sel="1" PartitionName="boot" FlashType="emmc" FileSystem="none" Start="112M" Length="60M" SelectFile="uimage.img"/>
 <Part Sel="0" PartitionName="misc" FlashType="emmc" FileSystem="none" Start="172M" Length="20M" SelectFile="misc.img"/>
 <Part Sel="0" PartitionName="trustedcore" FlashType="emmc" FileSystem="none" Start="192M" Length="20M" SelectFile="trustedcore.img"/>
 <Part Sel="1" PartitionName="rootfs" FlashType="emmc" FileSystem="none" Start="212M" Length="-" SelectFile="rootfs.img"/>
