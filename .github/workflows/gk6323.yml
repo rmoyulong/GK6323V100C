@@ -268,6 +268,103 @@ jobs:
           echo "=== 插入结果 ==="
           grep -n -B1 -A10 'GK6323_DTB_FALLBACK' arch/arm64/kernel/head.S
 
+      - name: 设备树硬件节点补丁（补全CRU时钟/USB PHY/外设复位，解决网卡USB声卡全挂）
+        run: |
+          set -euo pipefail
+          cd linux_build
+          # 用python写补丁避免YAML缩进/heredoc问题
+          cat > patch_dts.py << 'PY'
+          import os
+          from pathlib import Path
+          dts = Path(f"../{os.environ['BOARD_DTS']}")
+          t = dts.read_text()
+          if 'f8a22000.clock' in t:
+              print('硬件节点已存在，跳过')
+              exit(0)
+          # 补丁内容全部用空格缩进，不影响dts语法
+          p = [
+              '&soc {',
+              '\tclk: clock-controller@f8a22000 {',
+              '\t\tcompatible = "hisilicon,hi3798mv200-cru";',
+              '\t\treg = <0x0 0xf8a22000 0x0 0x1000>;',
+              '\t\t#clock-cells = <1>;',
+              '\t\t#reset-cells = <2>;',
+              '\t\tclocks = <&osc24m>;',
+              '\t\tclock-names = "osc";',
+              '\t};',
+              '',
+              '\tusb2_phy: usb-phy@f98c0000 {',
+              '\t\tcompatible = "hisilicon,hi3798cv200-usb2-phy";',
+              '\t\treg = <0x0 0xf98c0000 0x0 0x100>;',
+              '\t\t#phy-cells = <0>;',
+              '\t\tclocks = <&clk 0x12>;',
+              '\t\tclock-names = "phy";',
+              '\t\tresets = <&clk 0x10 0>;',
+              '\t\treset-names = "phy";',
+              '\t};',
+              '',
+              '\tsyscon@f8a20000 {',
+              '\t\tcompatible = "syscon", "simple-mfd";',
+              '\t\treg = <0x0 0xf8a20000 0x0 0x1000>;',
+              '\t};',
+              '};',
+              '',
+              '&eth {',
+              '\tclocks = <&clk 0x38>, <&clk 0x39>;',
+              '\tclock-names = "stmmaceth", "mac_clk_rx";',
+              '\tresets = <&clk 0x28 0>;',
+              '\treset-names = "stmmaceth";',
+              '\tphy-mode = "mii";',
+              '\tphy-handle = <&ethphy>;',
+              '\tmdio {',
+              '\t\t#address-cells = <1>;',
+              '\t\t#size-cells = <0>;',
+              '\t\tcompatible = "snps,dwmac-mdio";',
+              '\t\tethphy: ethernet-phy@0 {',
+              '\t\t\treg = <0>;',
+              '\t\t};',
+              '\t};',
+              '};',
+              '',
+              '&usb0 {',
+              '\tphys = <&usb2_phy>;',
+              '\tphy-names = "usb2-phy";',
+              '\tclocks = <&clk 0x18>;',
+              '\tresets = <&clk 0x14 0>;',
+              '};',
+              '',
+              '&usb1 {',
+              '\tphys = <&usb2_phy>;',
+              '\tphy-names = "usb2-phy";',
+              '\tclocks = <&clk 0x19>;',
+              '\tresets = <&clk 0x15 0>;',
+              '};',
+              '',
+              '&i2c0 {',
+              '\tclocks = <&clk 0x40>;',
+              '\tresets = <&clk 0x30 0>;',
+              '};',
+              '',
+              '&sdhci0 {',
+              '\tclocks = <&clk 0x50>, <&clk 0x51>;',
+              '\tclock-names = "biu", "ciu";',
+              '\tresets = <&clk 0x48 0>;',
+              '};',
+          ]
+          dts.write_text(t + '\n' + '\n'.join(p) + '\n')
+          print('已补全所有硬件节点')
+          PY
+          python3 patch_dts.py
+          echo "=== DTS节点校验 ==="
+          for k in "clock-controller@f8a22000" "usb-phy@f98c0000" "ethernet-phy@0"; do
+            if grep -q "$k" "../$BOARD_DTS"; then
+              echo "OK   $k"
+            else
+              echo "::error::dts 缺少 $k 节点，外设无法初始化"
+              exit 1
+            fi
+          done
+
       - name: 部署内核配置并强制关键驱动内置
         run: |
           set -euo pipefail
@@ -393,6 +490,8 @@ jobs:
           # ★ PHY_HISI_INNO_USB2 的父符号
           scripts/config --enable GENERIC_PHY
           scripts/config --enable USB_PHY
+          scripts/config --enable RESET_CONTROLLER
+          scripts/config --enable RESET_HISI
           scripts/config --enable USB_EHCI_HCD
           scripts/config --enable USB_EHCI_HCD_PLATFORM
           scripts/config --enable USB_OHCI_HCD
@@ -401,8 +500,10 @@ jobs:
           scripts/config --enable USB_STORAGE
           # ALSA 骨架：SND_PCM / SND_TIMER 是**无 prompt 符号**，取值只由 select 决定，
           # 在这里 --enable 也会被 olddefconfig 重算，故不写（见 kernel.config 附录）。
-          # ★ 本仓库存在的理由：USB 声卡 / USB DAC
+          # ★ 本仓库存在的理由：USB 声卡 / USB DAC + 内置ES8316声卡
           scripts/config --enable SND_USB
+          scripts/config --enable SND_SOC
+          scripts/config --enable SND_SOC_ES8316
           # ★ 这里必须用 --module，不能用 --enable：--enable 对 tristate 符号等于设成 y，
           #   会顶掉叠加层里的 =m，把 USB 音频编成内置，产物形态就不再是「内核 + 模块」，
           #   逐行自检还会报「叠加层未生效：CONFIG_SND_USB_AUDIO=m」。SND_USB 是 bool，用 --enable 正确。
@@ -425,7 +526,8 @@ jobs:
                    MMC_BLOCK MMC_DW_PLTFM \
                    EXT4_FS PARTITION_ADVANCED CMDLINE_PARTITION \
                    NET_VENDOR_HISILICON PHYLIB HISI_FEMAC \
-                   USB_EHCI_HCD PHY_HISI_INNO_USB2 MODULES; do
+                   RESET_CONTROLLER RESET_HISI GENERIC_PHY PHY_HISI_INNO_USB2 \
+                   USB_EHCI_HCD USB_OHCI_HCD MODULES; do
             if grep -qE "^CONFIG_${s}=[ym]$" .config; then
               echo "OK   $(grep -E "^CONFIG_${s}=" .config)"
             else
