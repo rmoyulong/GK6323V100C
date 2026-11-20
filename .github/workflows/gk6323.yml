@@ -365,6 +365,7 @@ jobs:
           scripts/config --enable COMMON_CLK
           scripts/config --enable COMMON_CLK_HI3798MV200
           scripts/config --enable RESET_CONTROLLER
+          scripts/config --enable RESET_HISI
           # 中断控制器 / 定时器（真机是 GICv3 + A55，不是 GIC-400 + A53）
           scripts/config --enable ARM_GIC
           scripts/config --enable ARM_GIC_V3
@@ -694,7 +695,12 @@ jobs:
           "$DTC" -I dts -O dtb -o "$OUT" "$BOARD_DTS"
           echo "=== 反编译回读关键项，确认编译结果与真机一致 ==="
           "$DTC" -I dtb -O dts "$OUT" > /tmp/rt.dts
-          for k in "arm,cortex-a55" "arm,gic-v3" "arm,pl011" "snps,dw-mshc" "gk6323v100c"; do
+          for k in "arm,cortex-a55" "arm,gic-v3" "arm,pl011" "goke,gk6323v100c" \
+                   "hisilicon,hi3798mv200-crg" \
+                   "hisilicon,hi3798mv200-dw-mshc" \
+                   "hisilicon,hi3798mv200-femac" \
+                   "hisilicon,hi3798mv200-usb2-phy" \
+                   "generic-ehci" "generic-ohci"; do
             if grep -q "$k" /tmp/rt.dts; then
               echo "OK   $k"
             else
