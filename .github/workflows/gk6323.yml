@@ -985,7 +985,7 @@ jobs:
           sed -i 's/^ *//' RELEASE_NOTES.md
           head -20 RELEASE_NOTES.md
 
-     - name: 发布到 GitHub Release-最新版
+      - name: 发布到 GitHub Release-最新版
         uses: softprops/action-gh-release@v2
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
