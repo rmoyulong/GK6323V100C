@@ -401,12 +401,11 @@ EOF
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: gk6323v100c-${{ env.PATCHES_KERNEL_VERSION }}
-          #body_path: linux_build/out/RELEASE_NOTES.md
           allowUpdates: true
           replacesArtifacts: true
           artifactErrorsFailBuild: true
           body: |
-            ## 更新日志
+            ##更新日志
             - 修复了 DTB（设备树二进制文件）中的时钟控制器节点，确保所有外设（网卡/USB/I2C）均具备正确的时钟与复位配置
             - 以太网：10/100M RMII PHY 现已正常工作
             - USB：EHCI/OHCI 2.0 主机功能正常，支持 U 盘及 USB 声卡
