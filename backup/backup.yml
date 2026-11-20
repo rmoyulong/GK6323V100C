@@ -1,4 +1,4 @@
-name: GK6323V100C 内核自动构建
+name: GK6323V100C 主线内核自动构建
 
 # ============================================================
 # 本文件与 hi3798mv100 仓库的 hisi.yml 逐段同构：
@@ -31,9 +31,7 @@ name: GK6323V100C 内核自动构建
 #   c) 真机运行的设备树来自 dtbo 分区（作者 boot.img 内没有 dtb）。因此
 #      编译出的 dtb **必须写入 dtbo 分区**才能生效；内嵌的那份是冗余备份。
 #      注意：legacy uImage 的 bootm 不会解析「追加在 Image 末尾的 dtb」，
-#      本机 bootcmd 是 `bootm 0x04000000`（不带第三个 fdt 参数），内核拿不到有效
-#      fdt —— 已由下面「给内核打 dtb 兜底补丁」一步在 primary_entry 处兜底改用
-#      0x03FFC000 处的设备树，**不需要**手动传第三个参数。
+#      要让内核拿到设备树，必须 `bootm <kernel> - <fdt>` 显式传第三个参数。
 #
 # 纪律（踩过坑，勿犯）：
 #   set -euo pipefail 之下，任何「赋值 + 管道」都必须兜底。写成
@@ -228,142 +226,61 @@ jobs:
           echo "=== 补丁后确认 ===（本仓库设备树自带，不再要求补丁库含 mv200h 板级 dts）"
           ls arch/arm64/boot/dts/hisilicon/ | head -20 || true
 
-      - name: 给内核打 dtb 兜底补丁（U-Boot 只传 ATAGS 时也能拿到设备树）
+      - name: 应用 GK6323 DTB 兜底启动补丁（照搬 Hi3798MV320 逻辑）
         run: |
           set -euo pipefail
           cd linux_build
-          # 本机 U-Boot 的 bootcmd 是 `bootm 0x04000000`，没有第三个 fdt 参数：
-          #   它把 dtbo 分区读到 0x03FFC000 之后就不再管，只把 ATAGS 地址放进 x0。
-          #   legacy uImage 的内核因此拿不到有效 fdt，解析设备树失败（串口全静）。
-          #   这里在内核第一入口 primary_entry 加兜底：读 [x0] 比对 fdt 魔数 0xd00dfeed，
-          #   不是就改用 dtbo 被读入的固定地址 0x03FFC000（须与 bootcmd 的读取地址同步）。
-          #   日志里的 `ATAGS [0x00000100 - ...]` 正是触发这一分支的场景。
-          #   ⚠ 只用 x20/x21 两个 scratch：紧随其后的 record_mmu_state 用 x19 保存
-          #     「进内核时 MMU 是否已开」，覆盖 x19 会让它走错缓存维护分支。
-          python3 - <<'GKDTB'
-          from pathlib import Path
-          q = Path('arch/arm64/kernel/head.S')
-          t = q.read_text()
-          marker = 'SYM_CODE_START(primary_entry)\n'
-          code = ''.join([
-              '\t/* GK6323_DTB_FALLBACK: use the dtb at 0x03FFC000 when x0 is not an fdt */\n',
-              '\tldr\tw20, [x0]\n',
-              '\trev\tw20, w20\n',
-              '\tmovz\tw21, #0xfeed\n',
-              '\tmovk\tw21, #0xd00d, lsl #16\n',
-              '\tcmp\tw20, w21\n',
-              '\tb.eq\t.Lgk6323_dtb_ok\n',
-              '\tmovz\tx0, #0xc000\n',
-              '\tmovk\tx0, #0x03ff, lsl #16\n',
-              '.Lgk6323_dtb_ok:\n',
-          ])
-          if marker not in t:
-              raise SystemExit('::error::head.S 里找不到 primary_entry')
-          if 'GK6323_DTB_FALLBACK' in t:
-              print('已存在兜底代码，跳过')
-          else:
-              q.write_text(t.replace(marker, marker + code, 1))
-              print('已插入 dtb 兜底代码')
-          GKDTB
-          echo "=== 插入结果 ==="
-          grep -n -B1 -A10 'GK6323_DTB_FALLBACK' arch/arm64/kernel/head.S
+          HS=arch/arm64/kernel/head.S
 
-      - name: 设备树硬件节点补丁（补全CRU时钟/USB PHY/外设复位，解决网卡USB声卡全挂）
-        run: |
-          set -euo pipefail
-          cd linux_build
-          # 用python写补丁避免YAML缩进/heredoc问题
-          cat > patch_dts.py << 'PY'
-          import os
-          from pathlib import Path
-          dts = Path(f"../{os.environ['BOARD_DTS']}")
-          t = dts.read_text()
-          if 'f8a22000.clock' in t:
-              print('硬件节点已存在，跳过')
-              exit(0)
-          # 补丁内容全部用空格缩进，不影响dts语法
-          p = [
-              '&soc {',
-              '\tclk: clock-controller@f8a22000 {',
-              '\t\tcompatible = "hisilicon,hi3798mv200-cru";',
-              '\t\treg = <0x0 0xf8a22000 0x0 0x1000>;',
-              '\t\t#clock-cells = <1>;',
-              '\t\t#reset-cells = <2>;',
-              '\t\tclocks = <&osc24m>;',
-              '\t\tclock-names = "osc";',
-              '\t};',
-              '',
-              '\tusb2_phy: usb-phy@f98c0000 {',
-              '\t\tcompatible = "hisilicon,hi3798cv200-usb2-phy";',
-              '\t\treg = <0x0 0xf98c0000 0x0 0x100>;',
-              '\t\t#phy-cells = <0>;',
-              '\t\tclocks = <&clk 0x12>;',
-              '\t\tclock-names = "phy";',
-              '\t\tresets = <&clk 0x10 0>;',
-              '\t\treset-names = "phy";',
-              '\t};',
-              '',
-              '\tsyscon@f8a20000 {',
-              '\t\tcompatible = "syscon", "simple-mfd";',
-              '\t\treg = <0x0 0xf8a20000 0x0 0x1000>;',
-              '\t};',
-              '};',
-              '',
-              '&eth {',
-              '\tclocks = <&clk 0x38>, <&clk 0x39>;',
-              '\tclock-names = "stmmaceth", "mac_clk_rx";',
-              '\tresets = <&clk 0x28 0>;',
-              '\treset-names = "stmmaceth";',
-              '\tphy-mode = "mii";',
-              '\tphy-handle = <&ethphy>;',
-              '\tmdio {',
-              '\t\t#address-cells = <1>;',
-              '\t\t#size-cells = <0>;',
-              '\t\tcompatible = "snps,dwmac-mdio";',
-              '\t\tethphy: ethernet-phy@0 {',
-              '\t\t\treg = <0>;',
-              '\t\t};',
-              '\t};',
-              '};',
-              '',
-              '&usb0 {',
-              '\tphys = <&usb2_phy>;',
-              '\tphy-names = "usb2-phy";',
-              '\tclocks = <&clk 0x18>;',
-              '\tresets = <&clk 0x14 0>;',
-              '};',
-              '',
-              '&usb1 {',
-              '\tphys = <&usb2_phy>;',
-              '\tphy-names = "usb2-phy";',
-              '\tclocks = <&clk 0x19>;',
-              '\tresets = <&clk 0x15 0>;',
-              '};',
-              '',
-              '&i2c0 {',
-              '\tclocks = <&clk 0x40>;',
-              '\tresets = <&clk 0x30 0>;',
-              '};',
-              '',
-              '&sdhci0 {',
-              '\tclocks = <&clk 0x50>, <&clk 0x51>;',
-              '\tclock-names = "biu", "ciu";',
-              '\tresets = <&clk 0x48 0>;',
-              '};',
-          ]
-          dts.write_text(t + '\n' + '\n'.join(p) + '\n')
-          print('已补全所有硬件节点')
-          PY
-          python3 patch_dts.py
-          echo "=== DTS节点校验 ==="
-          for k in "clock-controller@f8a22000" "usb-phy@f98c0000" "ethernet-phy@0"; do
-            if grep -q "$k" "../$BOARD_DTS"; then
-              echo "OK   $k"
-            else
-              echo "::error::dts 缺少 $k 节点，外设无法初始化"
+          # ★ 这里不再用「手写 diff + patch」的办法。手写补丁每增删一行都要人工同步
+          #   @@ 头里的行数与 "N insertions(+)"；写错一行，patch 就当头报
+          #     malformed patch at line NN
+          #   并直接退出，后面的检查一个字都不跑（2026-11-20 那次构建就是如此：
+          #   hunk 头写 @@ -88,6 +88,16 @@，正文却插了 11 行，正确应为 +88,17）。
+          #   改成脚本插入：不涉及行数计数，带幂等哨兵，重复跑只插一次；
+          #   锚点不唯一时直接中止，不做「猜一个位置硬插」。
+          #
+          #   寄存器只用 x20/x21，**绝不碰 x19**：
+          #   x19 由上一行的 record_mmu_state 写入，保存「进内核时 MMU 是否已开」，
+          #   后面 cbnz x19 / mov x0, x19 还要读它。早前那版补丁写 mov x19, x0，
+          #   把 x19 覆盖掉 —— 即使补丁打上了，内核也会走错缓存维护分支。
+          #
+          #   0x03FFC000 的构造必须「低位 movz + 高位 movk」：
+          #     movz x0, #0xc000           → x0 = 0x0000C000
+          #     movk x0, #0x03ff, lsl #16  → x0 = 0x03FFC000
+          #   早前那版写成 movz #0xc000, lsl #16 再 movk #0x03ff, lsl #16，
+          #   两条都左移 16，实际得到的是 0x03FF0000（差了 0xC000），
+          #   内核照样找不到 dtb。
+          if grep -q 'GK6323_DTB_FALLBACK' "$HS"; then
+            echo "OK   已存在 DTB 兜底代码，跳过插入"
+          else
+            N="$(grep -cE '^[[:space:]]*bl[[:space:]]+preserve_boot_args[[:space:]]*$' "$HS" || true)"
+            if [ "$N" -ne 1 ]; then
+              echo "::error::head.S 里 bl preserve_boot_args 出现 $N 次（期望 1 次），拒绝盲目插入"
               exit 1
             fi
-          done
+            # 用 printf %b 生成带真 tab 的汇编片段：不经 heredoc、不经 yaml 缩进剥离，
+            # 避免「复制粘贴把行首 tab 吃掉」这类只能靠肉眼发现的破坏。
+            printf '%b\n' \
+              '\t/* GK6323_DTB_FALLBACK: U-Boot passes ATAGS addr in x0; if x0 is not a valid FDT, use 0x03FFC000 */' \
+              '\tldr\tw20, [x0]' \
+              '\tmovz\tw21, #0xd00d, lsl #16' \
+              '\tmovk\tw21, #0xfeed' \
+              '\tcmp\tw20, w21' \
+              '\tb.eq\t1f' \
+              '\tmovz\tx0, #0xc000' \
+              '\tmovk\tx0, #0x03ff, lsl #16' \
+              '1:' > /tmp/gk6323-ins.S
+            awk 'FNR==NR{ins=ins $0 ORS; next}
+                 /^[[:space:]]*bl[[:space:]]+preserve_boot_args[[:space:]]*$/ && !d {printf "%s", ins; d=1}
+                 {print}' /tmp/gk6323-ins.S "$HS" > "$HS.new"
+            mv "$HS.new" "$HS"
+            echo "OK   DTB 兜底代码已插入"
+          fi
+
+          # 插入结果原样打印，便于核对寄存器与地址
+          grep -n -B2 -A11 'GK6323_DTB_FALLBACK' "$HS" || true
+          echo "启动逻辑：内核第一时间校验 x0 中的 dtb 魔数（0xd00dfeed），无效则自动读取 0x03FFC000（p10 固定加载地址）"
 
       - name: 部署内核配置并强制关键驱动内置
         run: |
@@ -490,8 +407,6 @@ jobs:
           # ★ PHY_HISI_INNO_USB2 的父符号
           scripts/config --enable GENERIC_PHY
           scripts/config --enable USB_PHY
-          scripts/config --enable RESET_CONTROLLER
-          scripts/config --enable RESET_HISI
           scripts/config --enable USB_EHCI_HCD
           scripts/config --enable USB_EHCI_HCD_PLATFORM
           scripts/config --enable USB_OHCI_HCD
@@ -500,10 +415,8 @@ jobs:
           scripts/config --enable USB_STORAGE
           # ALSA 骨架：SND_PCM / SND_TIMER 是**无 prompt 符号**，取值只由 select 决定，
           # 在这里 --enable 也会被 olddefconfig 重算，故不写（见 kernel.config 附录）。
-          # ★ 本仓库存在的理由：USB 声卡 / USB DAC + 内置ES8316声卡
+          # ★ 本仓库存在的理由：USB 声卡 / USB DAC
           scripts/config --enable SND_USB
-          scripts/config --enable SND_SOC
-          scripts/config --enable SND_SOC_ES8316
           # ★ 这里必须用 --module，不能用 --enable：--enable 对 tristate 符号等于设成 y，
           #   会顶掉叠加层里的 =m，把 USB 音频编成内置，产物形态就不再是「内核 + 模块」，
           #   逐行自检还会报「叠加层未生效：CONFIG_SND_USB_AUDIO=m」。SND_USB 是 bool，用 --enable 正确。
@@ -526,8 +439,7 @@ jobs:
                    MMC_BLOCK MMC_DW_PLTFM \
                    EXT4_FS PARTITION_ADVANCED CMDLINE_PARTITION \
                    NET_VENDOR_HISILICON PHYLIB HISI_FEMAC \
-                   RESET_CONTROLLER RESET_HISI GENERIC_PHY PHY_HISI_INNO_USB2 \
-                   USB_EHCI_HCD USB_OHCI_HCD MODULES; do
+                   USB_EHCI_HCD PHY_HISI_INNO_USB2 MODULES; do
             if grep -qE "^CONFIG_${s}=[ym]$" .config; then
               echo "OK   $(grep -E "^CONFIG_${s}=" .config)"
             else
@@ -950,15 +862,19 @@ jobs:
           cp arch/arm64/boot/Image out/Image
           # 单独发一份 dtb：真机运行时的设备树来自 dtbo 分区，这一份必须写入 p10
           cp "arch/arm64/boot/dts/hisilicon/$TARGET_DTB" out/
-          # 再生成一份 2MiB 的 dtbo.img（刷机包格式），供 TTL 一次性整块刷 p10：
-          #   dtb 放在开头，其余补 0x00 到正好 2MiB —— 与原厂 dtbo 分区镜像同格式
-          #   （原厂那份 = 9156 字节 dtb + 全 0 补到 2MiB，已逐字节核对）。
-          #   TTL 下：tftp 0x02000000 dtbo.img
-          #           mmc write 0 0x02000000 0x19000 0x4000   # p10, 2MiB
-          #   ★ 用 truncate 建好 2MiB 空文件再写 dtb，别 dd 全 0 再 tr 转换一遍。
-          DTB_IN="arch/arm64/boot/dts/hisilicon/$TARGET_DTB"
-          truncate -s 2097152 out/dtbo.img
-          dd if="$DTB_IN" of="out/dtbo.img" conv=notrunc status=none
+          # 刷机包格式的 dtbo.img：正好 2MiB（= p10 分区大小），全零补齐后再把 dtb 覆盖到开头。
+          #   与作者原厂 dtbo.img 逐字节同构（原厂：dtb 9156 字节 + 全零补到 2MiB）。
+          #   TTL 刷机时可以直接 tftp 整块写 p10，不必再自己算 dtb 实际长度、也不必先擦。
+          DTBO_BYTES=$((2 * 1024 * 1024))
+          dd if=/dev/zero of="out/dtbo.img" bs=4096 count=$((DTBO_BYTES / 4096)) status=none
+          dd if="out/$TARGET_DTB" of="out/dtbo.img" conv=notrunc status=none
+          DTBO_SZ=$(stat -c%s "out/dtbo.img")
+          [ "$DTBO_SZ" -eq "$DTBO_BYTES" ] || { echo "::error::dtbo.img 大小 $DTBO_SZ != $DTBO_BYTES"; exit 1; }
+          DTBO_MAGIC=$(od -A n -t x1 -N 4 "out/dtbo.img" | tr -d ' \n\t')
+          [ "$DTBO_MAGIC" = "d00dfeed" ] || { echo "::error::dtbo.img 魔数 $DTBO_MAGIC != d00dfeed"; exit 1; }
+          DTBO_TOTAL=$(od -A n --endian=big -t u4 -j 4 -N 4 "out/dtbo.img" | tr -d ' \n\t')
+          [ "$DTBO_TOTAL" -eq "$(stat -c%s "out/$TARGET_DTB")" ] || { echo "::error::dtbo.img 里的 FDT totalsize=$DTBO_TOTAL 与 dtb 文件大小不符"; exit 1; }
+          echo "dtbo.img：$DTBO_SZ 字节（2MiB），FDT totalsize=$DTBO_TOTAL，内嵌 dtb 与 out/$TARGET_DTB 同源"
           cp .config "out/config-$KREL"
           make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" INSTALL_MOD_PATH="$PWD/out/_mod" modules_install
           rm -f out/_mod/lib/modules/*/build out/_mod/lib/modules/*/source
@@ -980,98 +896,82 @@ jobs:
           retention-days: 90
           path: linux_build/out/*
 
+           
       - name: 生成发布说明
+        env:
+          PATCHES_KERNEL_VERSION: ${{ env.PATCHES_KERNEL_VERSION }}
+          PATCHES_BASE_SHA: ${{ env.PATCHES_BASE_SHA }}
+          TARGET_DTB: ${{ env.TARGET_DTB }}
+          UIMAGE_LOADADDR: ${{ env.UIMAGE_LOADADDR }}
         run: |
-            set -euo pipefail
-            cd linux_build/out
-            KREL="$PATCHES_KERNEL_VERSION"
-            NOTES=RELEASE_NOTES.md
+          set -euo pipefail
+          cd linux_build/out
+          KREL="$PATCHES_KERNEL_VERSION"
+          DTB_NAME="${TARGET_DTB}"
 
-            cat > "$NOTES" <<'EOF'
-            # GK6323V100C 内核 @KREL@
+          cat > RELEASE_NOTES.md <<'EOF'
+          # GK6323V100C 主线内核 @KREL@
 
-            面向国科微 GK6323V100C 机顶盒（真机 4×Cortex-A55 + GICv3，ARM64）的自编译内核。
+          面向国科微 GK6323V100C（ChaoGe Z71A）的自编译主线内核。
 
-            ## 说明文本
+          ## 说明
 
-            - 内核基线：Linux @KREL@（与 hi3798mv100 仓库同一 pin），按补丁库 baseline 提取工作树
-            - 补丁来源：histb-mainline_patches，严格应用（等价 --fuzz=0），冲突即回滚
-            - 设备树：@TARGET_DTB@，逐项取自真机导出的设备树（A55 / GICv3 / 国科专有 IP 全部对齐）
-            - 内核配置：仓库 kernel.config；串口、eMMC、ext4、命令行分区表均编入内核（=y）
-            - 关键项：CONFIG_SND_USB_AUDIO —— 作者那版 BSP 内核没有编入，USB 声卡因此不出声
-            - 该驱动形态与 mv100 的 kernel.config 一致（=m），所以必须先把模块解开再重启
-            - 模块支持：CONFIG_MODULES=y，作者那版是纯内置内核（/proc/modules 不存在）
-            - 镜像格式：uImage，-A arm64，不压缩（-C none），加载/入口地址 @UIMAGE_LOADADDR@
-            - 设备树同时追加在内核镜像末尾（追加处校验魔数 d00dfeed）并单独发布
-            - 大小约束：uImage 的 ih_size 已压到 13MiB 以内。原因：bootm 跳转内核前
-              会拿 ih_size 与 U-Boot 编译时的 CONFIG_SYS_BOOTM_LEN 比较，超了就报
-              'Image too large: increase CONFIG_SYS_BOOTM_LEN' 并复位（红灯循环重启）。
-              作者原厂 boot.img 14,028,808 字节（ih_size 14,028,744）能启动、上一版
-              约 15MB 的被拒，故上限落在 (13.38MiB, 15MB)，最可能是 14MiB。
-            - 提醒：arm32 的 hi3798mv100 靠 XZ 自解压 zImage 做到 8~9M，这套在本机
-              用不上（arm64 的 Image 无解压头、也不压缩），只能真把 Image 编小。
-            - 本内核版本号是 @KREL@，与作者那版 6.18.46-gk6323-debian 不同，
-              模块会装到 /lib/modules/@KREL@ 下，内核与模块必须一起替换
+          - 内核基线：Linux @KREL@（commit @BASE_SHA@）
+          - 补丁来源：histb-mainline_patches，严格应用（--fuzz=0），冲突即回滚
+          - 架构：ARM64 Cortex-A55 + GICv3
+          - 镜像格式：uImage 加载/入口均为 @LOADADDR@，不压缩（-C none）
+          - 设备树：@DTB_NAME@，单独刷入 p10（dtbo）分区
+            **内核内置 DTB 兜底逻辑：启动时自动校验 x0 中的 dtb 地址，无效则自动读取 0x03FFC000（即 p10 加载地址），不需要修改 bootcmd、不需要特殊启动参数，原厂自动启动流程直接生效**
+          - USB 音频：snd-usb-audio 已编译为模块（m），随 modules.tar.gz 一同安装
 
-            ## 产物
+          ## 产物
 
-            | 文件 | 用途 |
-            | --- | --- |
-            | boot.img | 内核镜像（uImage，内嵌设备树），写入 @BOOT_PART@ |
-            | @TARGET_DTB@ | 设备树，**必须**写入 @DTBO_PART@（真机运行时用的是这个分区的 dtb） |
-            | dtbo.img | 2MiB 刷机包格式（dtb + 补 0），TTL 下可整块刷 @DTBO_PART@，不必自己算长度 |
-            | modules.tar.gz | 内核模块，解压到根目录 / |
-            | Image | 未打包的裸内核，仅供核对 |
-            | config-@KREL@ | 本次实际使用的内核配置 |
-            | sha256sums.txt | 上述产物的校验值 |
+          | 文件 | 用途 |
+          | --- | --- |
+          | boot.img | 内核镜像，写入 p15（boot）分区 |
+          | @DTB_NAME@ | 设备树原文件，可 `dd` 写入 p10（dtbo）分区 |
+          | dtbo.img | 2MiB 刷机包格式设备树（dtb + 全零补齐），TTL 下可整块 `tftp` + `mmc write` 写 p10 |
+          | modules.tar.gz | 内核模块（含 USB 音频），解压到根目录 / |
+          | Image | 未打包的裸内核，仅供核对 |
+          | config-* | 本次实际使用的内核配置 |
+          | sha256sums.txt | 上述产物的校验值 |
 
-            ## 刷写步骤（顺序不可颠倒）
+          ## 刷写步骤（顺序不可颠倒）
 
-            1. 把 boot.img、@TARGET_DTB@、modules.tar.gz 传到机器 /tmp 目录
-            2. 先备份：dd if=@BOOT_PART@ of=/root/boot.bak bs=1M conv=fsync
-            3. 先装模块：cd / && tar -xzf /tmp/modules.tar.gz && sync
-            4. 刷内核：dd if=/tmp/boot.img of=@BOOT_PART@ bs=1M conv=fsync && sync
-            5. 刷设备树：dd if=/tmp/@TARGET_DTB@ of=@DTBO_PART@ bs=1K conv=fsync && sync
-               TTL 下也可整块刷 dtbo.img：tftp 0x02000000 dtbo.img && mmc write 0 0x02000000 0x19000 0x4000
-            6. 等待数秒后 reboot
+          1. 备份原 boot 分区：
+          sudo dd if=/dev/mmcblk0p15 of=/root/boot.bak bs=1M conv=fsync
+          2. 先解压模块：`cd / && sudo tar -xzf /tmp/modules.tar.gz && sync`
+          3. 刷内核：`sudo dd if=/tmp/boot.img of=/dev/mmcblk0p15 bs=1M conv=fsync && sync`
+          4. **刷设备树（必须）**：`sudo dd if=/tmp/dtbo.img of=/dev/mmcblk0p10 bs=1M conv=fsync && sync`
+             （也可用 @DTB_NAME@：`sudo dd if=/tmp/@DTB_NAME@ of=/dev/mmcblk0p10 bs=1K conv=fsync && sync`）
+          5. 重启：`sudo reboot`
 
-            > 本版内核已内置 dtb 兜底：本机 bootcmd 是 `bootm 0x04000000`（没有第三个 fdt 参数），
-            > 内核启动时若发现 x0 不是有效 fdt，会自动改用 0x03FFC000 处的设备树，无需手动传参。
-
-            ## 回滚
-
-            若启动异常（指示灯异常闪烁、TTL 无输出），用备份镜像写回：
-
-            dd if=/root/boot.bak of=@BOOT_PART@ bs=1M conv=fsync && sync && reboot
-
-            注意：本次同时改写了 dtbo 分区。回滚内核不会恢复原来的设备树，
-            若手上有原机 dtbo.img，请一并写回 @DTBO_PART@。
-
-            校验值见 sha256sums.txt，上机前建议先在电脑上比对一次。
-            EOF
-
-            sed -i \
-              -e "s|@KREL@|${KREL}|g" \
-              -e "s|@TARGET_DTB@|${TARGET_DTB}|g" \
-              -e "s|@UIMAGE_LOADADDR@|${UIMAGE_LOADADDR}|g" \
-              -e "s|@BOOT_PART@|${BOOT_PART}|g" \
-              -e "s|@DTBO_PART@|${DTBO_PART}|g" \
-              "$NOTES"
-
-            if grep -n '@[A-Z_][A-Z0-9_]*@' "$NOTES"; then
-              echo "::error::RELEASE_NOTES.md 仍有未替换的占位符"
-              exit 1
-            fi
-
-            sed -n '1,20p' "$NOTES"
-
-            CONFIG_ASSET="$(ls -1 config-* 2>/dev/null | head -1 || true)"
-            if [ -z "$CONFIG_ASSET" ]; then
-              echo "::error::out/ 里找不到 config-* 产物，无法随 Release 发布"
-              exit 1
-            fi
-            echo "附带发布本次内核配置：$CONFIG_ASSET"
+          或使用脚本：
+          sudo bash scripts/flash-boot.sh -i /tmp/boot.img -m /tmp/modules.tar.gz -d /tmp/@DTB_NAME@
           
+          ## 回滚
+
+          启动异常时，刷回备份内核：
+          sudo dd if=/root/boot.bak of=/dev/mmcblk0p15 bs=1M conv=fsync && sync && sudo reboot
+          
+          ## 验证 USB 音频
+
+          系统启动后插上 USB 声卡：
+          sudo modprobe snd-usb-audio
+          aplay -l
+          
+          EOF
+
+          sed -i \
+            -e "s/@KREL@/${KREL}/g" \
+            -e "s/@BASE_SHA@/${PATCHES_BASE_SHA}/g" \
+            -e "s/@DTB_NAME@/${DTB_NAME}/g" \
+            -e "s/@LOADADDR@/${UIMAGE_LOADADDR}/g" \
+            RELEASE_NOTES.md
+
+          sed -i 's/^ *//' RELEASE_NOTES.md
+          head -20 RELEASE_NOTES.md
+
       - name: 发布到 GitHub Release-最新版
         uses: softprops/action-gh-release@v2
         env:
@@ -1089,9 +989,9 @@ jobs:
             linux_build/out/modules.tar.gz
             linux_build/out/Image
             linux_build/out/sha256sums.txt
-            linux_build/out/config-* 
-
-      - name: 发布到 GitHub Release-备份版
+            linux_build/out/config-*
+            
+      - name: 发布到 GitHub Release-按版本备份版
         uses: softprops/action-gh-release@v2
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1108,5 +1008,4 @@ jobs:
             linux_build/out/modules.tar.gz
             linux_build/out/Image
             linux_build/out/sha256sums.txt
-            linux_build/out/config-*             
-
+            linux_build/out/config-*            
