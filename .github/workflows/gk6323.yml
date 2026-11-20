@@ -972,7 +972,7 @@ jobs:
           sed -i 's/^ *//' RELEASE_NOTES.md
           head -20 RELEASE_NOTES.md
 
-      - name: 发布到 GitHub Release
+      - name: 发布到 GitHub Release-最新版
         uses: softprops/action-gh-release@v2
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -990,3 +990,22 @@ jobs:
             linux_build/out/Image
             linux_build/out/sha256sums.txt
             linux_build/out/config-*
+            
+      - name: 发布到 GitHub Release-按版本备份版
+        uses: softprops/action-gh-release@v2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: gk6323v100c-${{ env.PATCHES_KERNEL_VERSION }}
+          body_path: linux_build/out/RELEASE_NOTES.md
+          allowUpdates: true
+          replacesArtifacts: true
+          artifactErrorsFailBuild: true
+          files: |
+            linux_build/out/boot.img
+            linux_build/out/dtbo.img
+            linux_build/out/${{ env.TARGET_DTB }}
+            linux_build/out/modules.tar.gz
+            linux_build/out/Image
+            linux_build/out/sha256sums.txt
+            linux_build/out/config-*            
