@@ -977,12 +977,12 @@ jobs:
           fi
           echo "附带发布本次内核配置：$CONFIG_ASSET"
           
-      - name: 发布到 GitHub Release
+      - name: 发布到 GitHub Release-最新版
         uses: softprops/action-gh-release@v2
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: gk6323v100c-${{ env.PATCHES_KERNEL_VERSION }}-b${{ github.run_number }}
+          tag_name: gk6323v100c-latest
           body_path: linux_build/out/RELEASE_NOTES.md
           allowUpdates: true
           replacesArtifacts: true
@@ -994,4 +994,23 @@ jobs:
             linux_build/out/modules.tar.gz
             linux_build/out/Image
             linux_build/out/sha256sums.txt
-            linux_build/out/config-*          
+            linux_build/out/config-* 
+
+      - name: 发布到 GitHub Release-备份版
+        uses: softprops/action-gh-release@v2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: gk6323v100c-${{ env.PATCHES_KERNEL_VERSION }}
+          body_path: linux_build/out/RELEASE_NOTES.md
+          allowUpdates: true
+          replacesArtifacts: true
+          artifactErrorsFailBuild: true
+          files: |
+            linux_build/out/boot.img
+            linux_build/out/dtbo.img
+            linux_build/out/${{ env.TARGET_DTB }}
+            linux_build/out/modules.tar.gz
+            linux_build/out/Image
+            linux_build/out/sha256sums.txt
+            linux_build/out/config-*             
