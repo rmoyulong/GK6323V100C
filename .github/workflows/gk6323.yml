@@ -252,17 +252,18 @@ jobs:
             echo "OK Kconfig 已存在 COMMON_CLK_GK6323V100C，跳过"
           else
             {
-              echo ""
-              echo "config COMMON_CLK_GK6323V100C"
-              echo "\ttristate \"Clock driver for GK6323V100C CRG\""
-              echo "\tdepends on ARCH_HISI || COMPILE_TEST"
-              echo "\tdepends on HAS_IOMEM"
-              echo "\tdepends on RESET_CONTROLLER"
-              echo "\tdefault ARCH_HI3798MV200"
-              echo "\thelp"
-              echo "\t  Minimal clock and reset driver for GK6323V100C CRG."
-              echo "\t  Registers gate clocks and resets for eMMC/USB2/FEMAC;"
-              echo "\t  other PLLs/peripherals are left to U-Boot."
+              # 必须用 printf：bash 内建 echo 不解析 \t，会把字面量 \t 写进
+              # Kconfig，导致 kconfig 解析报错（构建在 scripts/kconfig 阶段直接失败）。
+              printf '\n'
+              printf 'config COMMON_CLK_GK6323V100C\n'
+              printf '\ttristate "Clock driver for GK6323V100C CRG"\n'
+              printf '\tdepends on COMMON_CLK\n'
+              printf '\tdepends on HAS_IOMEM\n'
+              printf '\tdepends on RESET_CONTROLLER\n'
+              printf '\thelp\n'
+              printf '\t  Minimal clock and reset driver for GK6323V100C CRG.\n'
+              printf '\t  Registers gate clocks and resets for eMMC/USB2/FEMAC;\n'
+              printf '\t  other PLLs/peripherals are left to U-Boot.\n'
             } >> "$KC"
             echo "OK 已向 Kconfig 追加 COMMON_CLK_GK6323V100C"
           fi
@@ -270,7 +271,7 @@ jobs:
           if grep -q "crg-gk6323v100c" "$MK"; then
             echo "OK Makefile 已存在 crg-gk6323v100c，跳过"
           else
-            echo "obj-\$(CONFIG_COMMON_CLK_GK6323V100C)\t+= crg-gk6323v100c.o" >> "$MK"
+            printf 'obj-$(CONFIG_COMMON_CLK_GK6323V100C)\t+= crg-gk6323v100c.o\n' >> "$MK"
             echo "OK 已向 Makefile 追加 crg-gk6323v100c.o"
           fi
 

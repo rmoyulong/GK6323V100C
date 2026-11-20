@@ -1,64 +1,42 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 599e11c70c40bc0fdbac5d6fd7a1188ce4c0e09d Mon Sep 17 00:00:00 2001
 From: GK6323 Mainline Port <mainline@gk6323.local>
-Date: Fri, 20 Nov 2026 23:00:00 +0800
-Subject: [PATCH] clk: hisilicon: add GK6323V100C minimal CRG driver source and headers
+Date: Sat, 21 Nov 2026 01:20:12 +0800
+Subject: [PATCH] clk: hisilicon: add GK6323V100C minimal CRG driver source and
+ headers
 
-Add the source file and dt-bindings headers for the GK6323V100C
-minimal CRG (Clock/Reset Generator) driver.
-
-Kconfig and Makefile entries are appended by the workflow shell
-step (not by this patch), because the hisilicon clk Kconfig/Makefile
-already exist on mainline and patch-hunk line numbers would be
-brittle across kernel versions.
-
-Only three verified peripheral groups are exposed:
-  - eMMC (dw-mmc):       PERI_CRG40 @ 0x0a0
-  - USB2 EHCI/OHCI:      PERI_CRG46 @ 0x0b8, PERI_CRG47 @ 0x0bc
-  - FEMAC ethernet:      PERI_CRG51 @ 0x0cc, PERI_CRG52 @ 0x0d0
-
-PLL, I2C, IR, SPI, AIAO, VDM/GPU clocks are intentionally NOT
-registered to avoid writing to un-verified registers, which has
-caused boot hangs (black screen) on the board.  All PLLs are left
-in the state configured by U-Boot.
-
-The driver uses arch_initcall_sync so it probes after the console
-is up.  It probes against the "goke,gk6323v100c-crg" compatible
-string.
-
-Register base f8a22000 and bit positions are cross-verified against
-the vendor device tree (GK6323V100C dtbo partition) and the
-HiSTBLinux Hi3798MV310 BSP source (clk-hi3798mv310.c), both of
-which match the vendor TTL log line:
-  gk6323v100c-cru f8a22000.clock: gk6323v100c: ...
-
-Signed-off-by: GK6323 Mainline Port <mainline@gk6323.local>
 ---
- drivers/clk/hisilicon/crg-gk6323v100c.c        | 218 ++++++++++++++++++
- include/dt-bindings/clock/gk6323v100c-crg.h    |  23 ++
- include/dt-bindings/reset/gk6323v100c-resets.h |  20 ++
- 3 files changed, 261 insertions(+)
+ drivers/clk/hisilicon/crg-gk6323v100c.c       | 236 ++++++++++++++++++
+ include/dt-bindings/clock/gk6323v100c-crg.h   |  26 ++
+ .../dt-bindings/reset/gk6323v100c-resets.h    |  24 ++
+ 3 files changed, 286 insertions(+)
  create mode 100644 drivers/clk/hisilicon/crg-gk6323v100c.c
  create mode 100644 include/dt-bindings/clock/gk6323v100c-crg.h
  create mode 100644 include/dt-bindings/reset/gk6323v100c-resets.h
 
 diff --git a/drivers/clk/hisilicon/crg-gk6323v100c.c b/drivers/clk/hisilicon/crg-gk6323v100c.c
 new file mode 100644
-index 000000000000..aaaaaaaaaaa
+index 0000000..d8020dd
 --- /dev/null
 +++ b/drivers/clk/hisilicon/crg-gk6323v100c.c
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,236 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * GK6323V100C minimal CRG (Clock/Reset Generator) driver
 + *
-+ * Only registers three verified peripheral groups:
-+ *   - eMMC (dw-mmc):       PERI_CRG40 @ 0x0a0
-+ *   - USB2 EHCI/OHCI:      PERI_CRG46 @ 0x0b8, PERI_CRG47 @ 0x0bc
-+ *   - FEMAC ethernet:      PERI_CRG51 @ 0x0cc, PERI_CRG52 @ 0x0d0
++ * 仅注册已通过原厂设备树 + BSP 源码交叉验证的 3 组外设门控与复位：
++ *   - eMMC (dw-mmc):       PERI_CRG40 @ 0x0a0, reset bit 4
++ *   - USB2 EHCI/OHCI:      PERI_CRG46 @ 0x0b8, reset bits 12/13/14
++ *                          PERI_CRG47 @ 0x0bc, PHY reset bits 4/8/9
++ *   - FEMAC ethernet:      PERI_CRG51 @ 0x0cc (BUS), PERI_CRG52 @ 0x0d0 (IF),
++ *                          reset bit 0 (bus), bit 1 (MACIF)
 + *
-+ * PLLs and unverified gate clocks are intentionally left alone;
-+ * U-Boot has already configured them, we just enable gates and
-+ * release resets for the three peripherals above.
++ * 刻意不注册：PLL、I2C、IR、SPI、AIAO、VDM/GPU 等未在当前主线 dts 中
++ * 验证的门控，避免误写寄存器导致系统挂死。PLL 全部保持 U-Boot 设好的状态。
++ *
++ * 基地址来自原厂设备树：f8a22000（与原厂 TTL 打印一致）
++ *
++ * 初始化时机：arch_initcall_sync，控制台已建好，probe 出错 dmesg 可见，
++ *            不会像 CLK_OF_DECLARE 那样在控制台建立前把时钟树写乱导致花屏。
 + */
 +
 +#include <linux/clk-provider.h>
@@ -72,6 +50,7 @@ index 000000000000..aaaaaaaaaaa
 +#include <dt-bindings/clock/gk6323v100c-crg.h>
 +#include <dt-bindings/reset/gk6323v100c-resets.h>
 +
++/* 每组门控时钟描述：名字、父时钟、寄存器偏移、门控位、状态标志 */
 +struct gk_gate_clock {
 +	const char *name;
 +	const char *parent_name;
@@ -80,33 +59,50 @@ index 000000000000..aaaaaaaaaaa
 +	unsigned long flags;
 +};
 +
++/*
++ * 时钟 ID 定义见 include/dt-bindings/clock/gk6323v100c-crg.h
++ * 顺序与头文件中宏顺序严格对应
++ */
 +static const struct gk_gate_clock gk_crg_clks[] = {
-+	[GK6323_CLK_MCI_BUS]     = { "mci0_bus",    "osc24m", 0xa0, 0, CLK_SET_RATE_PARENT },
-+	[GK6323_CLK_MCI_CIU]     = { "mci0_ciu",    "osc24m", 0xa0, 1, CLK_SET_RATE_PARENT },
-+	[GK6323_CLK_USB2_BUS]    = { "usb2_bus",    "osc24m", 0xb8, 0, 0 },
-+	[GK6323_CLK_USB2_OHCI]   = { "usb2_ohci",   "osc24m", 0xb8, 1, 0 },
-+	[GK6323_CLK_USB2_HSTPHY] = { "usb2_hstphy", "osc24m", 0xb8, 4, 0 },
-+	[GK6323_CLK_USB2_UTMI0]  = { "usb2_utmi0",  "osc24m", 0xb8, 5, 0 },
-+	[GK6323_CLK_USB2_PHY_REF]= { "usb2_phy_ref","osc24m", 0xbc, 0, 0 },
-+	[GK6323_CLK_FEMAC_BUS]   = { "femac_bus",   "osc24m", 0xcc, 0, 0 },
-+	[GK6323_CLK_FEMAC_IF]    = { "femac_if",    "osc24m", 0xd0, 0, CLK_SET_RATE_PARENT },
++	/* eMMC — PERI_CRG40 @ 0xa0 */
++	[GK6323_CLK_MCI_BUS]   = { "mci0_bus",    "osc24m", 0xa0, 0, CLK_SET_RATE_PARENT },
++	[GK6323_CLK_MCI_CIU]   = { "mci0_ciu",    "osc24m", 0xa0, 1, CLK_SET_RATE_PARENT },
++
++	/* USB2 — PERI_CRG46 @ 0xb8 */
++	[GK6323_CLK_USB2_BUS]   = { "usb2_bus",    "osc24m", 0xb8, 0, 0 },
++	[GK6323_CLK_USB2_OHCI]  = { "usb2_ohci",   "osc24m", 0xb8, 1, 0 },
++	[GK6323_CLK_USB2_HSTPHY]= { "usb2_hstphy", "osc24m", 0xb8, 4, 0 },
++	[GK6323_CLK_USB2_UTMI0] = { "usb2_utmi0",  "osc24m", 0xb8, 5, 0 },
++	/* USB2 PHY 参考时钟 PERI_CRG47 @ 0xbc */
++	[GK6323_CLK_USB2_PHY_REF] = { "usb2_phy_ref","osc24m", 0xbc, 0, 0 },
++
++	/* FEMAC 以太网 — PERI_CRG51/52 */
++	[GK6323_CLK_FEMAC_BUS]  = { "femac_bus", "osc24m", 0xcc, 0, 0 },
++	[GK6323_CLK_FEMAC_IF]   = { "femac_if",  "osc24m", 0xd0, 0, CLK_SET_RATE_PARENT },
 +};
 +
 +#define GK_CRG_NR_CLKS		ARRAY_SIZE(gk_crg_clks)
 +
++/* 复位控制：每个复位 = 寄存器偏移 + 位号（写1置位，写0释放） */
 +struct gk_reset_desc {
 +	u32 reg_offset;
 +	u8 reset_bit;
 +};
 +
++/* 复位 ID 定义见 include/dt-bindings/reset/gk6323v100c-resets.h */
 +static const struct gk_reset_desc gk_crg_resets[] = {
-+	[GK6323_RST_MCI0]         = { 0xa0, 4  },
-+	[GK6323_RST_USB2_HST]     = { 0xb8, 12 },
-+	[GK6323_RST_USB2_UTMI0]   = { 0xb8, 13 },
-+	[GK6323_RST_USB2_PHY]     = { 0xbc, 4  },
-+	[GK6323_RST_USB2_PORT0]   = { 0xbc, 8  },
-+	[GK6323_RST_FEMAC_BUS]    = { 0xcc, 0  },
-+	[GK6323_RST_FEMAC_MACIF]  = { 0xd0, 1  },
++	/* eMMC 软复位: PERI_CRG40 @ 0xa0 bit 4 */
++	[GK6323_RST_MCI0]        = { 0xa0, 4 },
++
++	/* USB2: PERI_CRG46 bit12=HOST, bit13=UTMI0; PERI_CRG47 bit4=PHY APB, bit8=PORT0 */
++	[GK6323_RST_USB2_HST]    = { 0xb8, 12 },
++	[GK6323_RST_USB2_UTMI0]  = { 0xb8, 13 },
++	[GK6323_RST_USB2_PHY]    = { 0xbc, 4  },
++	[GK6323_RST_USB2_PORT0]  = { 0xbc, 8  },
++
++	/* FEMAC: PERI_CRG51 bit0=BUS, PERI_CRG52 bit1=MACIF */
++	[GK6323_RST_FEMAC_BUS]   = { 0xcc, 0 },
++	[GK6323_RST_FEMAC_MACIF] = { 0xd0, 1 },
 +};
 +
 +#define GK_CRG_NR_RESETS	ARRAY_SIZE(gk_crg_resets)
@@ -261,23 +257,30 @@ index 000000000000..aaaaaaaaaaa
 +MODULE_LICENSE("GPL v2");
 diff --git a/include/dt-bindings/clock/gk6323v100c-crg.h b/include/dt-bindings/clock/gk6323v100c-crg.h
 new file mode 100644
-index 000000000000..bbbbbbbbbb
+index 0000000..6d2662d
 --- /dev/null
 +++ b/include/dt-bindings/clock/gk6323v100c-crg.h
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,26 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * GK6323V100C CRG clock IDs
++ * 仅列出本最小驱动中实际注册的时钟；其他时钟暂不启用，避免误写寄存器。
++ */
 +#ifndef __DT_BINDINGS_CLOCK_GK6323V100C_CRG_H
 +#define __DT_BINDINGS_CLOCK_GK6323V100C_CRG_H
 +
++/* eMMC — PERI_CRG40 */
 +#define GK6323_CLK_MCI_BUS		0
 +#define GK6323_CLK_MCI_CIU		1
 +
++/* USB2 — PERI_CRG46 / 47 */
 +#define GK6323_CLK_USB2_BUS		2
 +#define GK6323_CLK_USB2_OHCI		3
 +#define GK6323_CLK_USB2_HSTPHY		4
 +#define GK6323_CLK_USB2_UTMI0		5
 +#define GK6323_CLK_USB2_PHY_REF		6
 +
++/* FEMAC 以太网 — PERI_CRG51 / 52 */
 +#define GK6323_CLK_FEMAC_BUS		7
 +#define GK6323_CLK_FEMAC_IF		8
 +
@@ -286,26 +289,31 @@ index 000000000000..bbbbbbbbbb
 +#endif
 diff --git a/include/dt-bindings/reset/gk6323v100c-resets.h b/include/dt-bindings/reset/gk6323v100c-resets.h
 new file mode 100644
-index 00000000000..bbbbbbbbbb
+index 0000000..0d0c4b2
 --- /dev/null
 +++ b/include/dt-bindings/reset/gk6323v100c-resets.h
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,24 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * GK6323V100C CRG reset IDs
++ * 仅列出本最小驱动中实际注册的复位线。
++ */
 +#ifndef __DT_BINDINGS_RESET_GK6323V100C_RESETS_H
 +#define __DT_BINDINGS_RESET_GK6323V100C_RESETS_H
 +
++/* eMMC */
 +#define GK6323_RST_MCI0			0
 +
++/* USB2 */
 +#define GK6323_RST_USB2_HST		1
 +#define GK6323_RST_USB2_UTMI0		2
 +#define GK6323_RST_USB2_PHY		3
 +#define GK6323_RST_USB2_PORT0		4
 +
++/* FEMAC */
 +#define GK6323_RST_FEMAC_BUS		5
 +#define GK6323_RST_FEMAC_MACIF		6
 +
 +#define GK6323_RST_CRGC_NR		7
 +
 +#endif
---
-2.43.0
