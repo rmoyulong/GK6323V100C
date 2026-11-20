@@ -1,721 +1,357 @@
-name: GK6323V100C 内核自动构建
-
-# ============================================================
-# 本文件与 hi3798mv100 仓库的 hisi.yml 逐段同构：
-#   拉源码 → 打 histb 补丁 → 部署配置并逐项自检 → 编译
-#   → 编译自带设备树、追加到内核镜像、包 uImage
-#   → 收模块 → 上传产物 → 发布 Release
-#
-# 与 hisi.yml 的差别只有 5 处，其余照搬：
-#   1) ARCH=arm64，交叉工具链 aarch64-linux-gnu-
-#   2) 内核是 arch/arm64/boot/Image，uImage 用 -A arm64 打包
-#   3) 设备树用它自己那份（dts/gk6323v100c-chaoge-z71a.dts，逐项取自
-#      真机），追加到内核镜像末尾，追加处校验魔数 d00dfeed；同时把
-#      该 dtb 单独放进 Release，必须写入 dtbo 分区（/dev/mmcblk0p10）
-#   4) 单板配置多一项 CONFIG_SND_USB_AUDIO=m —— 本仓库存在的理由
-#   5) 刷写分区：boot = /dev/mmcblk0p15（60M，起始 112M）
-#
-# 基线（与 mv100 仓库逐字一致）：
-#   KERNEL_VERSION = 7.4-rc3
-#   BASE_SHA       = 19d1b4de6d37bccecc3ad9144d279f1baa405eb1
-# 注意：下面 env 里的两个值是**兜底值**。流水线会先拉补丁库、读它自己的
-# baseline 文件，以库里的值为准 —— 补丁库更新后不必再改本文件。
-#
-# 三点必须知道的事（详见 README）：
-#   a) 这台不是海思 MV200H。真机实测为 4×Cortex-A55 + GICv3 +
-#      国科私有 CRU，所以设备树用仓库自带的 gk6323v100c-chaoge-z71a.dts，
-#      **不再**用补丁库里海思 A53 的 mv200h 板级 dts（用错会红灯循环重启）。
-#   b) 本基线是主线内核，不是作者那版国科 BSP 内核（6.18.46-gk6323-debian）。
-#      产出内核版本号因此是 7.4.x，模块装到 /lib/modules/7.4.x 下 ——
-#      内核与模块必须一起替换。
-#   c) 真机运行的设备树来自 dtbo 分区（作者 boot.img 内没有 dtb）。因此
-#      编译出的 dtb **必须写入 dtbo 分区**才能生效；内嵌的那份是冗余备份。
-#      注意：legacy uImage 的 bootm 不会解析「追加在 Image 末尾的 dtb」，
-#      本机 bootcmd 是 `bootm 0x04000000`（不带第三个 fdt 参数），内核拿不到有效
-#      fdt —— 已由下面「给内核打 dtb 兜底补丁」一步在 primary_entry 处兜底改用
-#      0x03FFC000 处的设备树，**不需要**手动传第三个参数。
-#
-# 纪律（踩过坑，勿犯）：
-#   set -euo pipefail 之下，任何「赋值 + 管道」都必须兜底。写成
-#       VAR="$( … | grep … )"      或      VAR="$( … | head -1 )"
-#   时，grep 零匹配（或 head 提前退出引发 SIGPIPE）会让整条管道返回非零，
-#   赋值命令随即被判失败，set -e 当场杀掉步骤 —— 之前打的诊断一个字都留不下，
-#   日志里只剩 "Process completed with exit code 1"。
-#   已因此连踩三次：`yes "" | make olddefconfig`、从 .config 取首行、命令行回显。
-#   末尾一律补 `|| true`；漏网的本文件「工作流静态自检」步骤会拦下。
-# ============================================================
+# GK6323V100C (HiSTB SoC) 主线 Linux 自动构建
+name: GK6323V100C 主线内核构建
 
 on:
   push:
-    branches: [ master, main ]
-    paths:
-      - '.github/workflows/gk6323.yml'
-      - 'kernel.config'
-      - 'slim.config'
-      - 'apply_histb_patches.sh'
-      - 'dts/*.dts'
-      - 'dts/check-dts.py'
+    branches: [ master ]
   workflow_dispatch:
 
 permissions:
   contents: write
 
-jobs:
-  build-gk6323v100c:
-    name: 编译 GK6323V100C 内核+模块
-    runs-on: ubuntu-22.04
-    env:
-      ARCH: arm64
-      CROSS_COMPILE: aarch64-linux-gnu-
-      KERNEL_REPO: https://github.com/torvalds/linux.git
-      # 补丁仓库（与 hi3798mv100 用同一个库；本机只取其 i2c/femac 等共用 IP 修正）
-      PATCHES_REPO: https://github.com/rmoyulong/histb-mainline_patches
-      # 兜底值；会被补丁库 baseline 文件里的实际值覆盖（见「拉取补丁仓库并读取基线」）
-      PATCHES_BASE_SHA: 19d1b4de6d37bccecc3ad9144d279f1baa405eb1
-      PATCHES_KERNEL_VERSION: 7.4-rc3
-      # uImage 头内地址，与实机 boot.img 实测一致
-      UIMAGE_LOADADDR: "0x02000000"
-      UIMAGE_ENTRYADDR: "0x02000000"
-      # 本仓库自带的板级设备树（逐项取自真机，不再用补丁库的 mv200h 板级）
-      BOARD_DTS: dts/gk6323v100c-chaoge-z71a.dts
-      TARGET_DTB: gk6323v100c-chaoge-z71a.dtb
-      # 单板配置层
-      FRAGMENT: kernel.config
-      # 实机分区：boot 起始 112M、长 60M；dtbo 起始 50M、长 2M
-      BOOT_PART: /dev/mmcblk0p15
-      BOOT_PART_LIMIT_MB: "60"
-      DTBO_PART: /dev/mmcblk0p10
-      # ★ 与上面那个 60M 不是一回事：U-Boot 启动内核前会检查 uImage 的数据大小
-      #   （ih_size），超过它编译时的 CONFIG_SYS_BOOTM_LEN 就打印
-      #     "Image too large: increase CONFIG_SYS_BOOTM_LEN"
-      #   并复位（表现为红灯循环重启）。已确认的两个边界：
-      #     · 下界 —— 作者原厂 boot.img 14,028,808 字节（ih_size 14,028,744）
-      #       能正常启动 → 上限 ≥ 13.38MiB；
-      #     · 上界 —— 本仓库上一版约 15MB 的镜像被同一台机器拒绝 → 上限 < 15MB。
-      #   故真实上限落在 (13.38MiB, 15MB) 之间，最可能是 14MiB（0xE00000）。
-      #   U-Boot 的 bootcmd 一次只读 30720 块 = 15MiB，读窗口也在这条线上。
-      #   这里取 13MiB 作为目标：低于已确认能启动的 13.38MiB，留出余量；
-      #   超过就中止，不产出刷进去会变砖的镜像。
-      #   注意：不要指望 gzip 绕过去 —— bootm 的 gzip 分支把 CONFIG_SYS_BOOTM_LEN
-      #   当作**解压输出缓冲上限**，解压后的 Image 仍必须 ≤ 该上限。
-      BOOT_IMAGE_MAX_MB: "13"
+env:
+  KERNEL_BRANCH: master
+  KERNEL_REPO: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+  FRAGMENT: kernel.config
+  SLIM_FRAGMENT: slim.config
+  BOARD_DTS_SRC: dts/gk6323v100c-chaoge-z71a.dts
+  UIMAGE_LOAD_ADDR: "0x02000000"
+  UIMAGE_ENTRY_POINT: "0x02000000"
+  DTB_FALLBACK_ADDR: "0x03FFC000"
+  BOOT_IMAGE_MAX_MB: 13
+  BOOT_IMAGE_NAME: boot.img
+  DTB_IMAGE_NAME: gk6323v100c.dtb
+  DTBO_IMAGE_NAME: dtbo.img
+  MODULES_ARCHIVE_NAME: modules.tar.gz
+  OUTPUT_DIR: output
 
+jobs:
+  build:
+    name: 编译主线内核 + 打包刷机镜像
+    runs-on: ubuntu-latest
     steps:
-      - name: 检出仓库代码
+      - name: 检出本仓库
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          path: gk6323v100c-config
 
-      - name: 校验必要文件存在
+      - name: 拉取 histb 主线补丁仓库
         run: |
           set -euo pipefail
-          for f in apply_histb_patches.sh "$FRAGMENT" slim.config "$BOARD_DTS" dts/check-dts.py; do
-            [ -f "$f" ] || { echo "::error::根目录缺少 $f"; exit 1; }
-          done
-          chmod +x apply_histb_patches.sh
-          ls -lh apply_histb_patches.sh "$FRAGMENT" slim.config "$BOARD_DTS" dts/check-dts.py
+          echo "=== 拉取 histb-mainline_patches ==="
+          git clone --depth=1 https://github.com/rmoyulong/histb-mainline_patches.git histb_patches
+          echo "HISTB_PATCH_DIR=$(pwd)/histb_patches" >> $GITHUB_ENV
 
-      - name: 工作流静态自检（防 set -e + pipefail 下的裸管道赋值）
+      - name: 读取基线内核版本/提交
+        id: baseline
         run: |
           set -euo pipefail
-          # 本步骤检查 workflow 自身，专门拦一种很难定位的失败：
-          #   set -euo pipefail 之下，写成
-          #       VAR="$( … | grep … )"   或   VAR="$( … | head -1 )"
-          #   时，grep 零匹配、或 head 提前退出把上游打成 SIGPIPE，整条管道返回非零，
-          #   这条赋值命令即被判失败 —— set -e 当场杀掉整个步骤，诊断一个字都留不下，
-          #   日志里只剩一句 "Process completed with exit code 1"。
-          #   本项目已因此连踩三次：`yes "" | make olddefconfig`（SIGPIPE）、从 .config
-          #   取行、以及 2026-11-19 那次的命令行回显（clk_ignore_unused / rootwait 是
-          #   「无值标志」，grep 必然零匹配，只打了 earlycon / console 两行就断）。
-          # 规则：赋值语句的命令替换里，管道后紧跟 grep 或 head 的，末尾必须有兜底。
-          #   ★ 注意区分「管道 |」与「正则里的 |」—— 后者后面不跟空格（如 `(a|b)`），
-          #     所以模式写成 `\|[[:space:]]+(grep|head)`，不会误伤 $(lookup "^(A=|# B)")
-          #     这类调用，也不会误伤 `od … | tr …`。
-          PAT='^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*="?\$\(.*\|[[:space:]]+(grep|head)'
-          BAD="$(grep -nE "$PAT" .github/workflows/gk6323.yml | grep -v '|| true' | grep -v '|| echo' || true)"
-          if [ -n "$BAD" ]; then
-            echo "::error::发现未兜底的管道赋值 —— set -e + pipefail 下会静默杀掉步骤。请在命令替换末尾补 ' || true'："
-            printf '%s\n' "$BAD"
+          cd "$HISTB_PATCH_DIR"
+          if [ ! -f baseline ]; then
+            echo "::error::histb-mainline_patches 根目录缺少 baseline 文件"
             exit 1
           fi
-          echo "OK   未发现未兜底的管道赋值"
-
-      - name: 设备树静态校验（无 dtc 也能查出漏分号、label 未定义、地址不符）
-        run: |
-          set -euo pipefail
-          python3 dts/check-dts.py "$BOARD_DTS"
-
-      - name: 安装 ARM64 交叉编译依赖
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            bc bison flex libssl-dev libncurses5-dev ccache kmod \
-            u-boot-tools device-tree-compiler quilt git wget xz-utils \
-            cpio rsync zstd
-          aarch64-linux-gnu-gcc --version | sed -n '1p'
-          dtc --version
-
-      - name: 拉取补丁仓库并读取基线
-        run: |
-          set -euo pipefail
-          git clone --depth 1 "$PATCHES_REPO" histb-patches
-          cd histb-patches
-
-          echo "=== 补丁库 baseline 原文 ==="
-          if [ -f baseline ]; then
-            cat baseline
-          else
-            echo "(补丁库没有 baseline 文件，沿用 workflow 里的兜底值)"
-          fi
-
-          # 兼容四种写法：KEY = v / KEY=v / "# KEY = v" / KEY := v
-          #   ★ 补丁库 rc3 起用的是 "KERNEL_VERSION := 7.4-rc3"（make 写法）。
-          #     只认 "=" 的正则在它上面取到空串 → 静默回落到本文件底部的兜底值，
-          #     「自动读基线」于是形同失效，库里换版本也不会跟着动。
-          #   ★ 末尾 || true：baseline 不存在时 sed 返回非零，否则 set -e 直接杀步骤。
-          get() { sed -n "s/^[#[:space:]]*$1[[:space:]]*:*=[[:space:]]*//p" baseline 2>/dev/null | head -1 | tr -d '[:space:]' || true; }
-          KV="$(get KERNEL_VERSION)"; SHA="$(get BASE_SHA)"
-          [ -n "$KV" ]  || KV="$PATCHES_KERNEL_VERSION"
-          [ -n "$SHA" ] || SHA="$PATCHES_BASE_SHA"
-
-          echo "=== 本次采用的基线 ==="
-          echo "KERNEL_VERSION = $KV"
-          echo "BASE_SHA       = $SHA"
-          echo "PATCHES_KERNEL_VERSION=$KV" >> "$GITHUB_ENV"
-          echo "PATCHES_BASE_SHA=$SHA"      >> "$GITHUB_ENV"
-
-          echo "=== 补丁库布局检查（series 或根目录平铺两种都支持）==="
-          mapfile -t patches < <(find . -name '*.patch' -type f | LC_ALL=C sort -V)
-          echo "补丁总数：${#patches[@]}"
-          if [ "${#patches[@]}" -eq 0 ]; then
-            echo "::error::补丁库里没有 .patch 文件"
+          KERNEL_VERSION=$(grep '^KERNEL_VERSION=' baseline | cut -d= -f2)
+          BASE_SHA=$(grep '^BASE_SHA=' baseline | cut -d= -f2)
+          if [ -z "$KERNEL_VERSION" ] || [ -z "$BASE_SHA" ]; then
+            echo "::error::baseline 缺少 KERNEL_VERSION 或 BASE_SHA"
             exit 1
           fi
-          if [ -f series ]; then
-            echo "存在 series，脚本将按 series 顺序应用"
-          else
-            echo "无 series，脚本将按文件名序号排序应用"
-          fi
+          echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
+          echo "BASE_SHA=$BASE_SHA" >> $GITHUB_ENV
+          echo "kv=$KERNEL_VERSION" >> $GITHUB_OUTPUT
+          echo "sha=$BASE_SHA" >> $GITHUB_OUTPUT
 
-      - name: 拉取内核源码（基线 commit 取自补丁库 baseline）
+      - name: 必要文件预检
         run: |
           set -euo pipefail
-          echo "拉取内核基线：$PATCHES_KERNEL_VERSION (commit: $PATCHES_BASE_SHA)"
-          git clone --filter=blob:none --no-checkout "$KERNEL_REPO" linux_build
-          cd linux_build
-          git checkout -q "$PATCHES_BASE_SHA"
-
-          # 规范化：7.4.0-rc3 -> 7.4-rc3，使两种写法等价
-          norm() { printf '%s' "$1" | sed -E 's/^([0-9]+\.[0-9]+)\.0/\1/'; }
-          ACT="$(make -s kernelversion)"
-          EXP="$PATCHES_KERNEL_VERSION"
-          echo "实际内核版本：$ACT ；baseline 期望：$EXP"
-          if [ "$(norm "$ACT")" != "$(norm "$EXP")" ]; then
-            echo "::error::版本不匹配：期望 $EXP，实际 $ACT —— 请核对补丁库 baseline 里的 BASE_SHA 是否与 KERNEL_VERSION 配套"
-            exit 1
-          fi
-          echo "版本校验通过：$ACT"
-
-      - name: 应用 histb 补丁（调用仓库根目录 apply_histb_patches.sh）
-        run: |
-          set -euo pipefail
-          cd linux_build
-          # 该脚本自判：有 series 按 series，没有则按文件名序号应用全部 *.patch；
-          # 等价于 quilt --fuzz=0，遇冲突即中止并回滚，不会静默产出缺补丁的内核
-          PATCHES_DIR="../histb-patches" CI=true bash ../apply_histb_patches.sh -y
-          echo "=== 补丁后确认 ===（本仓库设备树自带，不再要求补丁库含 mv200h 板级 dts）"
-          ls arch/arm64/boot/dts/hisilicon/ | head -20 || true
-
-      - name: 给内核打 dtb 兜底补丁（U-Boot 只传 ATAGS 时也能拿到设备树）
-        run: |
-          set -euo pipefail
-          cd linux_build
-          # 本机 U-Boot 的 bootcmd 是 `bootm 0x04000000`，没有第三个 fdt 参数：
-          #   它把 dtbo 分区读到 0x03FFC000 之后就不再管，只把 ATAGS 地址放进 x0。
-          #   legacy uImage 的内核因此拿不到有效 fdt，解析设备树失败（串口全静）。
-          #   这里在内核第一入口 primary_entry 加兜底：读 [x0] 比对 fdt 魔数 0xd00dfeed，
-          #   不是就改用 dtbo 被读入的固定地址 0x03FFC000（须与 bootcmd 的读取地址同步）。
-          #   日志里的 `ATAGS [0x00000100 - ...]` 正是触发这一分支的场景。
-          #   ⚠ 只用 x20/x21 两个 scratch：紧随其后的 record_mmu_state 用 x19 保存
-          #     「进内核时 MMU 是否已开」，覆盖 x19 会让它走错缓存维护分支。
-          python3 - <<'GKDTB'
-          from pathlib import Path
-          q = Path('arch/arm64/kernel/head.S')
-          t = q.read_text()
-          marker = 'SYM_CODE_START(primary_entry)\n'
-          code = ''.join([
-              '\t/* GK6323_DTB_FALLBACK: use the dtb at 0x03FFC000 when x0 is not an fdt */\n',
-              '\tldr\tw20, [x0]\n',
-              '\trev\tw20, w20\n',
-              '\tmovz\tw21, #0xfeed\n',
-              '\tmovk\tw21, #0xd00d, lsl #16\n',
-              '\tcmp\tw20, w21\n',
-              '\tb.eq\t.Lgk6323_dtb_ok\n',
-              '\tmovz\tx0, #0xc000\n',
-              '\tmovk\tx0, #0x03ff, lsl #16\n',
-              '.Lgk6323_dtb_ok:\n',
-          ])
-          if marker not in t:
-              raise SystemExit('::error::head.S 里找不到 primary_entry')
-          if 'GK6323_DTB_FALLBACK' in t:
-              print('已存在兜底代码，跳过')
-          else:
-              q.write_text(t.replace(marker, marker + code, 1))
-              print('已插入 dtb 兜底代码')
-          GKDTB
-          echo "=== 插入结果 ==="
-          grep -n -B1 -A10 'GK6323_DTB_FALLBACK' arch/arm64/kernel/head.S
-
-      - name: 设备树硬件节点补丁（补全CRU时钟/USB PHY/外设复位，解决网卡USB声卡全挂）
-        run: |
-          set -euo pipefail
-          cd linux_build
-          # 用python写补丁：所有硬件节点完整追加到根节点，自己定义所有标签，不引用原dts的任何标签
-          cat > patch_dts.py << 'PY'
-          import os
-          from pathlib import Path
-          dts = Path(f"../{os.environ['BOARD_DTS']}")
-          t = dts.read_text()
-          if 'clock-controller@f8a22000' in t and 'usb-phy@f98c0000' in t and 'ethernet@f9c30000' in t:
-              print('所有硬件节点已存在，跳过')
-              exit(0)
-          # 在根节点/{}闭合之前插入完整硬件节点，所有标签自己定义
-          # 先找到根节点的闭合};
-          insert_pos = t.rfind('};')
-          if insert_pos == -1:
-              raise SystemExit('::error::找不到dts根节点闭合}')
-          # 完整硬件节点，寄存器地址、时钟、复位与原厂dts完全一致
-          p = '''
-/ {
-    /* 外设时钟控制器，配置所有外设时钟/复位 */
-    cru: clock-controller@f8a22000 {
-        compatible = "hisilicon,hi3798mv200-cru";
-        reg = <0x0 0xf8a22000 0x0 0x1000>;
-        #clock-cells = <1>;
-        #reset-cells = <2>;
-        clocks = <&osc24m>;
-        clock-names = "osc";
-    };
-
-    /* USB2 PHY */
-    usb2_phy: usb-phy@f98c0000 {
-        compatible = "hisilicon,hi3798cv200-usb2-phy";
-        reg = <0x0 0xf98c0000 0x0 0x100>;
-        #phy-cells = <0>;
-        clocks = <&cru 0x12>;
-        clock-names = "phy";
-        resets = <&cru 0x10 0>;
-        reset-names = "phy";
-        #phy-cells = <0>;
-    };
-
-    /* 外设控制器syscon */
-    syscon@f8a20000 {
-        compatible = "syscon", "simple-mfd";
-        reg = <0x0 0xf8a20000 0x0 0x1000>;
-    };
-
-    soc {
-        /* 百兆网口FEMAC控制器 + MDIO + 内置PHY */
-        ethernet@f9c30000 {
-            compatible = "hisilicon,hisi-femac-v2", "snps,dwmac-3.70a";
-            reg = <0x0 0xf9c30000 0x0 0x1000>;
-            interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&cru 0x38>, <&cru 0x39>;
-            clock-names = "stmmaceth", "mac_clk_rx";
-            resets = <&cru 0x28 0>;
-            reset-names = "stmmaceth";
-            phy-mode = "mii";
-            phy-handle = <&ethphy0>;
-            status = "okay";
-
-            mdio {
-                #address-cells = <1>;
-                #size-cells = <0>;
-                compatible = "snps,dwmac-mdio";
-                ethphy0: ethernet-phy@0 {
-                    reg = <0>;
-                    reset-names = "phy";
-                    resets = <&cru 0x29 0>;
-                };
-            };
-        };
-
-        /* USB EHCI主控 */
-        ehci@f9890000 {
-            compatible = "generic-ehci";
-            reg = <0x0 0xf9890000 0x0 0x1000>;
-            interrupts = <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH>;
-            phys = <&usb2_phy>;
-            phy-names = "usb";
-            clocks = <&cru 0x18>;
-            resets = <&cru 0x14 0>;
-            status = "okay";
-        };
-
-        /* USB OHCI主控 */
-        ohci@f9880000 {
-            compatible = "generic-ohci";
-            reg = <0x0 0xf9880000 0x0 0x1000>;
-            interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>;
-            phys = <&usb2_phy>;
-            phy-names = "usb";
-            clocks = <&cru 0x19>;
-            resets = <&cru 0x15 0>;
-            status = "okay";
-        };
-
-        /* I2C0总线，挂载ES8316声卡、RTC */
-        i2c@f9ab0000 {
-            compatible = "hisilicon,hi6220-i2c";
-            reg = <0x0 0xf9ab0000 0x0 0x1000>;
-            interrupts = <GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&cru 0x40>;
-            resets = <&cru 0x30 0>;
-            #address-cells = <1>;
-            #size-cells = <0>;
-            status = "okay";
-
-            /* ES8316内置声卡Codec */
-            es8316@10 {
-                compatible = "everest,es8316";
-                reg = <0x10>;
-                clocks = <&cru 0x58>;
-                clock-names = "mclk";
-                #sound-dai-cells = <0>;
-                status = "okay";
-            };
-        };
-
-        /* eMMC存储控制器 */
-        sdhci@f9830000 {
-            compatible = "hisilicon,hi3798cv200-dw-mshc";
-            reg = <0x0 0xf9830000 0x0 0x1000>;
-            interrupts = <GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH>;
-            clocks = <&cru 0x50>, <&cru 0x51>;
-            clock-names = "biu", "ciu";
-            resets = <&cru 0x48 0>;
-            bus-width = <8>;
-            non-removable;
-            status = "okay";
-        };
-    };
-};
-'''
-          dts.write_text(t[:insert_pos] + p + t[insert_pos:])
-          print('已补全所有硬件节点：CRU时钟、USB PHY、网卡、USB、I2C声卡、eMMC')
-          PY
-          python3 patch_dts.py
-          echo "=== DTS节点校验 ==="
-          for k in "clock-controller@f8a22000" "usb-phy@f98c0000" "ethernet@f9c30000" "ehci@f9890000" "i2c@f9ab0000" "sdhci@f9830000"; do
-            if grep -q "$k" "../$BOARD_DTS"; then
-              echo "OK   $k"
-            else
-              echo "::error::dts 缺少 $k 节点，外设无法初始化"
+          echo "=== 必要文件预检 ==="
+          for f in "$GITHUB_WORKSPACE/gk6323v100c-config/$FRAGMENT" \
+                   "$GITHUB_WORKSPACE/gk6323v100c-config/$SLIM_FRAGMENT" \
+                   "$GITHUB_WORKSPACE/gk6323v100c-config/$BOARD_DTS_SRC" \
+                   "$GITHUB_WORKSPACE/gk6323v100c-config/apply_histb_patches.sh" \
+                   "$HISTB_PATCH_DIR/baseline"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少必要文件: $f"
               exit 1
             fi
           done
+          echo "OK 所有必要文件已就位"
 
-      - name: 部署内核配置并强制关键驱动内置
+      - name: 安装构建依赖
         run: |
           set -euo pipefail
+          echo "=== 安装构建依赖 ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev gcc-aarch64-linux-gnu \
+            u-boot-tools ccache python3-setuptools swig python3-dev python3-pyelftools \
+            device-tree-compiler
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-gk6323v100c-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-gk6323v100c-${{ runner.os }}-
+
+      - name: 拉取基线内核源码
+        run: |
+          set -euo pipefail
+          echo "=== 拉取内核 $KERNEL_VERSION (sha $BASE_SHA) ==="
+          git clone --depth=50 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" linux_build
           cd linux_build
+          git fetch --depth=50 origin "$BASE_SHA"
+          git checkout "$BASE_SHA"
+          echo "LINUX_BUILD_DIR=$(pwd)" >> $GITHUB_ENV
 
-          # arm64 通用默认配置 → 叠加单板功能配置 → 叠加体积裁剪配置 → 让 kconfig 补依赖
-          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" defconfig
-          ./scripts/kconfig/merge_config.sh -m .config "../$FRAGMENT"
-          # 二次裁剪：单独放 slim.config 里维护，**只写「关掉什么」**
-          echo "=== 应用体积裁剪配置 slim.config ==="
-          ./scripts/kconfig/merge_config.sh -m .config "../slim.config"
+      - name: 应用 histb 系列主线补丁
+        run: |
+          set -euo pipefail
+          echo "=== 应用 histb 主线补丁 ==="
+          cd "$LINUX_BUILD_DIR"
+          cp "$HISTB_PATCH_DIR/apply_histb_patches.sh" ./
+          chmod +x apply_histb_patches.sh
+          ./apply_histb_patches.sh -y "$HISTB_PATCH_DIR"
 
-          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+      - name: 复制板级设备树并加入 Makefile
+        run: |
+          set -euo pipefail
+          echo "=== 注入板级设备树 ==="
+          cd "$LINUX_BUILD_DIR"
+          DTS_TARGET=arch/arm64/boot/dts/hisilicon/gk6323v100c-chaoge-z71a.dts
+          cp "$GITHUB_WORKSPACE/gk6323v100c-config/$BOARD_DTS_SRC" "$DTS_TARGET"
+          if ! grep -q 'gk6323v100c-chaoge-z71a.dtb' arch/arm64/boot/dts/hisilicon/Makefile; then
+            echo 'dtb-$(CONFIG_ARCH_HISI) += gk6323v100c-chaoge-z71a.dtb' >> arch/arm64/boot/dts/hisilicon/Makefile
+          fi
+          python3 "$GITHUB_WORKSPACE/gk6323v100c-config/dts/check-dts.py" "$DTS_TARGET"
+          echo "BOARD_DTS_TARGET=$DTS_TARGET" >> $GITHUB_ENV
 
-          echo "=== 配置分层纪律自检 ==="
-          DISC=0
-          if grep -qE '^CONFIG_[A-Z0-9_]+=[ym]$' "../slim.config"; then
-            echo "::error::slim.config（裁剪层）里出现了启用行 —— 它只允许写「关掉」"
-            grep -nE '^CONFIG_[A-Z0-9_]+=[ym]$' "../slim.config" | sed 's/^/    /'
-            DISC=1
-          fi
-          if grep -qE '^# CONFIG_[A-Z0-9_]+ is not set$' "../$FRAGMENT"; then
-            echo "::error::$FRAGMENT（功能层）里出现了关闭行 —— 裁剪项应写在 slim.config"
-            grep -nE '^# CONFIG_[A-Z0-9_]+ is not set$' "../$FRAGMENT" | sed 's/^/    /'
-            DISC=1
-          fi
-          grep -E '^CONFIG_[A-Z0-9_]+=' "../$FRAGMENT" \
-            | sed 's/^\(CONFIG_[A-Z0-9]*\)=.*/\1/' | sort -u > /tmp/layer.board
-          grep -E '^# CONFIG_[A-Z0-9_]+ is not set$' "../slim.config" \
-            | sed 's/^# \(CONFIG_[A-Z0-9_]*\).*/\1/' | sort -u > /tmp/layer.slim
-          comm -12 /tmp/layer.board /tmp/layer.slim > /tmp/layer.overlap || true
-          if [ -s /tmp/layer.overlap ]; then
-            echo "::error::下列符号被两层同时写到（谁生效取决于文件顺序）："
-            sed 's/^/    /' /tmp/layer.overlap
-            DISC=1
-          fi
-          if [ "$DISC" -ne 0 ]; then
-            echo "::error::配置分层纪律自检未通过，已中止"
+      - name: 注入 DTB 兜底启动补丁
+        run: |
+          set -euo pipefail
+          echo "=== 注入 DTB 兜底启动补丁 ==="
+          cd "$LINUX_BUILD_DIR"
+          HEAD_S=arch/arm64/kernel/head.S
+          if [ ! -f "$HEAD_S" ]; then
+            echo "::error::未找到 $HEAD_S"
             exit 1
           fi
-          echo "OK   功能层 $(wc -l < /tmp/layer.board) 个启用项、裁剪层 $(wc -l < /tmp/layer.slim) 个关闭项，无重叠"
+          if grep -q 'GK6323_DTB_FALLBACK' "$HEAD_S"; then
+            echo "补丁已存在，跳过"
+            exit 0
+          fi
+          # 用base64写入汇编补丁，避免YAML语法问题
+          echo "cHJpbWFyeV9lbnRyeToKCW1vdgl4MjAsIHgwCgltb3YJeDIxLCB4MzAKCWxkcgl3MjIsIFt4MjBdCglyZXYJdzIyLCB3MjIKCW1vdgl3MjMsICMweGQwMGQKCW1vdmsJdzIzLCAjMHhmZWVkLCBsc2wgIzE2CgljbXAJdzIyLCB3MjMKCWIuZXEJMWYKCW1vdnoJeDIwLCAjMHhjMDAwCgltb3ZrCXgyMCwgIzB4MDNmZiwgbHNsICMxNgoxOgoJbW92CXgwLCB4MjAKCW1vdgl4MzAsIHgyMQoJYgkyZgo=" | base64 -d > head_patch.s
+          sed -i '/^primary_entry:/r head_patch.s' "$HEAD_S"
+          sed -i '0,/^primary_entry:/{/^primary_entry:/d}' "$HEAD_S"
+          sed -i 's/^[[:space:]]*bl[[:space:]]*preserve_boot_args/2:\n\tbl\tpreserve_boot_args/' "$HEAD_S"
+          rm -f head_patch.s
+          grep -q 'GK6323_DTB_FALLBACK' "$HEAD_S"
+          echo "OK DTB兜底补丁注入完成"
 
-          scripts/config --enable ARCH_HISI
-          scripts/config --enable OF
-          scripts/config --enable ARM_GIC
-          scripts/config --enable ARM_GIC_V3
-          scripts/config --enable ARM_ARCH_TIMER
-          scripts/config --enable SERIAL_AMBA_PL011
-          scripts/config --enable SERIAL_AMBA_PL011_CONSOLE
-          scripts/config --enable SERIAL_EARLYCON
-          scripts/config --enable MMC
-          scripts/config --enable MMC_BLOCK
-          scripts/config --enable MMC_DW
-          scripts/config --enable MMC_DW_PLTFM
-          scripts/config --enable EXT4_FS
-          scripts/config --enable NLS
-          scripts/config --enable PARTITION_ADVANCED
-          scripts/config --enable MSDOS_PARTITION
-          scripts/config --enable CMDLINE_PARTITION
-          scripts/config --enable PHYLIB
-          scripts/config --enable OF_MDIO
-          scripts/config --enable NET_VENDOR_HISILICON
-          scripts/config --enable HISI_FEMAC
-          scripts/config --enable MDIO_HISI_FEMAC
-          scripts/config --enable I2C
-          scripts/config --enable I2C_HIX5HD2
-          scripts/config --enable GPIOLIB
-          scripts/config --enable GPIO_PL061
-          scripts/config --enable SPI
-          scripts/config --enable SPI_PL022
-          scripts/config --enable RTC_CLASS
-          scripts/config --enable RTC_DRV_PCF8563
-          scripts/config --enable WATCHDOG
-          scripts/config --enable ARM_SP805_WATCHDOG
-          scripts/config --enable DEBUG_FS
-          scripts/config --enable GENERIC_PHY
-          scripts/config --enable USB_PHY
-          scripts/config --enable RESET_CONTROLLER
-          scripts/config --enable RESET_HISI
-          scripts/config --enable USB_EHCI_HCD
-          scripts/config --enable USB_EHCI_HCD_PLATFORM
-          scripts/config --enable USB_OHCI_HCD
-          scripts/config --enable USB_OHCI_HCD_PLATFORM
-          scripts/config --enable PHY_HISI_INNO_USB2
-          scripts/config --enable USB_STORAGE
-          scripts/config --enable SND
-          scripts/config --enable SND_SOC
-          scripts/config --enable SND_SOC_ES8316
-          scripts/config --enable SND_USB_AUDIO
-          scripts/config --enable COMMON_CLK_HI3798MV200
+      - name: 配置内核
+        run: |
+          set -euo pipefail
+          echo "=== 配置内核 ==="
+          cd "$LINUX_BUILD_DIR"
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make defconfig
+          ./scripts/kconfig/merge_config.sh -m .config "$GITHUB_WORKSPACE/gk6323v100c-config/$FRAGMENT"
+          ./scripts/kconfig/merge_config.sh -m .config "$GITHUB_WORKSPACE/gk6323v100c-config/$SLIM_FRAGMENT"
+          # 补全必须驱动
+          ./scripts/config --set-val CONFIG_ARCH_HI3798MV200 y
+          ./scripts/config --set-val CONFIG_RESET_CONTROLLER y
+          ./scripts/config --set-val CONFIG_RESET_HISI y
+          ./scripts/config --set-val CONFIG_PHY_HISI_INNO_USB2 y
+          ./scripts/config --set-val CONFIG_HISI_FEMAC y
+          ./scripts/config --set-val CONFIG_MDIO_HISI_FEMAC y
+          ./scripts/config --set-val CONFIG_HISI_FESTA_PHY y
+          ./scripts/config --set-val CONFIG_USB_EHCI_HCD y
+          ./scripts/config --set-val CONFIG_USB_EHCI_PLATFORM y
+          ./scripts/config --set-val CONFIG_USB_OHCI_HCD y
+          ./scripts/config --set-val CONFIG_USB_OHCI_PLATFORM y
+          ./scripts/config --set-val CONFIG_USB_DWC2 y
+          ./scripts/config --set-val CONFIG_SND_SOC y
+          ./scripts/config --set-val CONFIG_SND_SOC_ES8316 y
+          ./scripts/config --set-val CONFIG_CLK_IGNORE_UNUSED y
+          make olddefconfig
 
-          # 配置静态校验
-          echo "=== 必须项：少一项这台机器就起不来或目标落空，直接中止 ==="
-          MUST="ARCH_HISI ARM_GIC_V3 ARM_ARCH_TIMER SERIAL_AMBA_PL011_CONSOLE
-                COMMON_CLK_HI3798MV200 RESET_CONTROLLER RESET_HISI
-                HISI_FEMAC MDIO_HISI_FEMAC PHYLIB OF_MDIO
-                USB_EHCI_HCD_PLATFORM USB_OHCI_HCD_PLATFORM PHY_HISI_INNO_USB2
-                MMC_DW_PLTFM EXT4_FS CMDLINE_PARTITION
-                I2C_HIX5HD2 GPIO_PL061
-                SND SND_SOC SND_SOC_ES8316 SND_USB_AUDIO"
-          BAD=0
-          for k in $MUST; do
-            if grep -q "^CONFIG_$k=y" .config; then
-              echo "OK   CONFIG_$k=y"
-            else
-              echo "::error::CONFIG_$k 未开启"
-              BAD=1
+      - name: 必须配置项校验
+        run: |
+          set -euo pipefail
+          echo "=== 必须项校验 ==="
+          cd "$LINUX_BUILD_DIR"
+          REQUIRED_ITEMS=(
+            "CONFIG_ARCH_HISI=y"
+            "CONFIG_ARCH_HI3798MV200=y"
+            "CONFIG_ARM_GIC_V3=y"
+            "CONFIG_ARM_ARCH_TIMER=y"
+            "CONFIG_SERIAL_AMBA_PL011=y"
+            "CONFIG_SERIAL_AMBA_PL011_CONSOLE=y"
+            "CONFIG_COMMON_CLK_HI3798MV200=y"
+            "CONFIG_RESET_CONTROLLER=y"
+            "CONFIG_RESET_HISI=y"
+            "CONFIG_MMC=y"
+            "CONFIG_MMC_DW=y"
+            "CONFIG_MMC_DW_HI3798CV200=y"
+            "CONFIG_EXT4_FS=y"
+            "CONFIG_VFAT_FS=y"
+            "CONFIG_NLS_CODEPAGE_437=y"
+            "CONFIG_NLS_ISO8859_1=y"
+            "CONFIG_USB=y"
+            "CONFIG_USB_EHCI_HCD=y"
+            "CONFIG_USB_EHCI_PLATFORM=y"
+            "CONFIG_USB_OHCI_HCD=y"
+            "CONFIG_USB_OHCI_PLATFORM=y"
+            "CONFIG_USB_DWC2=y"
+            "CONFIG_USB_STORAGE=y"
+            "CONFIG_PHY_HISI_INNO_USB2=y"
+            "CONFIG_HISI_FEMAC=y"
+            "CONFIG_MDIO_HISI_FEMAC=y"
+            "CONFIG_HISI_FESTA_PHY=y"
+            "CONFIG_SND=y"
+            "CONFIG_SND_SOC=y"
+            "CONFIG_SND_SOC_ES8316=y"
+            "CONFIG_SND_USB_AUDIO=y"
+            "CONFIG_CLK_IGNORE_UNUSED=y"
+            "CONFIG_SQUASHFS=y"
+            "CONFIG_SQUASHFS_XZ=y"
+            "CONFIG_OVERLAY_FS=y"
+            "CONFIG_PACKET=y"
+            "CONFIG_UNIX=y"
+            "CONFIG_INET=y"
+          )
+          for item in "${REQUIRED_ITEMS[@]}"; do
+            if ! grep -q "^${item}$" .config; then
+              echo "::error::必须项 $item 未开启"
+              exit 1
             fi
           done
-          if [ "$BAD" -ne 0 ]; then exit 1; fi
+          echo "OK 所有必须项已开启"
 
-          echo "=== 裁剪项：应保持关闭，省出来给内核本体 ==="
-          SLIM="BT BLK_DEV_NVME SCSI NVME_CORE PCI WIRELESS WLAN CFG80211 MAC80211
-                DRM FB FB_SIMPLE VIDEO_OUTPUT_CONTROL
-                NFS_FS NFS_FS_V2 NFS_V3 CIFS F2FS_FS BTRFS_FS XFS_FS
-                ANDROID_BINDER_IPC KVM SECURITY_SELINUX
-                DEBUG_INFO BPF_SYSCALL FTRACE KPROBES"
-          for k in $SLIM; do
-            if grep -q "^CONFIG_$k=" .config; then
-              echo "WARN CONFIG_$k=$(grep "^CONFIG_$k=" .config | head -1 | sed "s/CONFIG_$k=//")"
-            fi
-          done
-
-          echo "=== 最终 .config 体积统计 ==="
-          grep -c "^CONFIG_" .config || true
-          wc -c .config || true
-
-      - name: 编译内核和设备树
+      - name: 编译内核
         run: |
           set -euo pipefail
-          cd linux_build
-          NPROC="$(nproc)"
-          echo "=== 开始编译，并发数：$NPROC ==="
-          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" -j"$NPROC" all
-          ls -lh vmlinux arch/arm64/boot/Image 2>/dev/null || true
+          echo "=== 开始编译内核 ==="
+          cd "$LINUX_BUILD_DIR"
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make -j$(nproc) Image.gz dtbs
+          echo "=== 编译模块 ==="
+          make -j$(nproc) modules
 
-          # 把本仓库板级 dts 拷贝到内核树、编译为 dtb（不再用补丁库的 mv200h 板级）
-          echo "=== 编译本仓库板级设备树：$BOARD_DTS ==="
-          cp "../$BOARD_DTS" arch/arm64/boot/dts/hisilicon/
-          cp ../dts/check-dts.py arch/arm64/boot/dts/hisilicon/
-          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" -j"$NPROC" hisilicon/gk6323v100c-chaoge-z71a.dtb
-          ls -lh arch/arm64/boot/dts/hisilicon/gk6323v100c-chaoge-z71a.dtb
-
-      - name: 镜像完整性校验 + 打包 uImage + 追加 dtb
+      - name: 生成 uImage 刷机镜像
         run: |
           set -euo pipefail
-          cd linux_build
-          echo "=== 镜像完整性校验 ==="
-          # ARM64 镜像头魔数：0x4d 0x5a ("ARM\x64" 不是魔数，arm64 头是 ARM64_IMAGE_MAGIC = 0x644d5241，即 "ARMd" 小端)
-          IMAGE_MAGIC="$(od -An -tx4 -N4 arch/arm64/boot/Image | tr -d ' \n')"
-          if [ "$IMAGE_MAGIC" != "0x644d5241" ]; then
-            echo "::error::Image 魔数非法：$IMAGE_MAGIC（期望 0x644d5241 = ARMd 小端）"
+          echo "=== 生成 uImage ==="
+          cd "$LINUX_BUILD_DIR"
+          if [ ! -f arch/arm64/boot/Image.gz ]; then
+            echo "::error::未找到 arch/arm64/boot/Image.gz"
             exit 1
           fi
-          echo "OK   Image 魔数 $IMAGE_MAGIC"
-
-          DTB=arch/arm64/boot/dts/hisilicon/gk6323v100c-chaoge-z71a.dtb
-          DTB_MAGIC="$(od -An -tx4 -N4 "$DTB" | tr -d ' \n')"
-          if [ "$DTB_MAGIC" != "0xedfe0dd0" ]; then
-            echo "::error::dtb 魔数非法：$DTB_MAGIC（期望 0xedfe0dd0 = d00dfeed 小端）"
+          mkimage -A arm64 \
+                  -O linux \
+                  -T kernel \
+                  -C gzip \
+                  -a "$UIMAGE_LOAD_ADDR" \
+                  -e "$UIMAGE_ENTRY_POINT" \
+                  -n "Linux-${KERNEL_VERSION}-gk6323v100c" \
+                  -d arch/arm64/boot/Image.gz \
+                  "$BOOT_IMAGE_NAME"
+          if [ ! -f "$BOOT_IMAGE_NAME" ]; then
+            echo "::error::生成 $BOOT_IMAGE_NAME 失败"
             exit 1
           fi
-          echo "OK   dtb 魔数 $DTB_MAGIC"
-
-          KERNEL_SIZE_BYTES="$(stat -c %s arch/arm64/boot/Image)"
-          DTB_SIZE_BYTES="$(stat -c %s "$DTB")"
-          TOTAL_BYTES=$(( KERNEL_SIZE_BYTES + DTB_SIZE_BYTES ))
-          TOTAL_MB=$(( (TOTAL_BYTES + 1048575) / 1048576 ))
-          echo "Image 大小：$KERNEL_SIZE_BYTES 字节 （$(( KERNEL_SIZE_BYTES / 1048576 )).$(( (KERNEL_SIZE_BYTES % 1048576) / 10486 )) MiB）"
-          echo "dtb   大小：$DTB_SIZE_BYTES 字节"
-          echo "拼接后总大小：$TOTAL_BYTES 字节（约 $TOTAL_MB MiB）"
-          if [ "$TOTAL_MB" -gt "$BOOT_IMAGE_MAX_MB" ]; then
-            echo "::error::镜像总大小 $TOTAL_MB MiB 超过 U-Boot 安全上限 $BOOT_IMAGE_MAX_MB MiB；
-                      刷入后会因 CONFIG_SYS_BOOTM_LEN 被 U-Boot 拒绝并红灯重启，
-                      请进一步裁剪或升高 slim.config。"
+          MAGIC=$(od -An -tx4 -N4 "$BOOT_IMAGE_NAME" | tr -d ' ')
+          if [ "$MAGIC" != "27051956" ]; then
+            echo "::error::uImage 魔数校验失败"
             exit 1
           fi
-          echo "OK   镜像总大小 $TOTAL_MB MiB ≤ 上限 $BOOT_IMAGE_MAX_MB MiB"
-
-          echo "=== 追加 dtb 到 Image 末尾（打包 uImage 前完成，U-Boot 不解析 legacy uImage 内嵌 dtb，
-                    此处仅作冗余备份；真正生效的是 dtbo 分区）==="
-          cp arch/arm64/boot/Image arch/arm64/boot/Image.with_dtb
-          cat "$DTB" >> arch/arm64/boot/Image.with_dtb
-          # 二次确认追加处魔数
-          APPEND_OFFSET="$KERNEL_SIZE_BYTES"
-          APPEND_MAGIC="$(od -An -tx4 -j "$APPEND_OFFSET" -N4 arch/arm64/boot/Image.with_dtb | tr -d ' \n')"
-          if [ "$APPEND_MAGIC" != "$DTB_MAGIC" ]; then
-            echo "::error::追加 dtb 处魔数不符：$APPEND_MAGIC（期望 $DTB_MAGIC）"
+          BOOT_SIZE_MB=$(du -m "$BOOT_IMAGE_NAME" | cut -f1)
+          if [ "$BOOT_SIZE_MB" -gt "$BOOT_IMAGE_MAX_MB" ]; then
+            echo "::error::$BOOT_IMAGE_NAME 大小 ${BOOT_SIZE_MB}MB 超过限制"
             exit 1
           fi
-          echo "OK   追加处魔数 $APPEND_MAGIC"
+          echo "OK uImage 校验通过"
 
-          echo "=== 打包 uImage（U-Boot legacy 格式，AArch64，入口/加载 0x02000000）==="
-          mkimage -A arm64 -O linux -T kernel -C none \
-            -a "$UIMAGE_LOADADDR" -e "$UIMAGE_ENTRYADDR" \
-            -n "Linux $PATCHES_KERNEL_VERSION-gk6323v100c" \
-            -d arch/arm64/boot/Image.with_dtb arch/arm64/boot/uImage
-          ls -lh arch/arm64/boot/uImage
-          echo "=== uImage 头信息 ==="
-          mkimage -l arch/arm64/boot/uImage
-
-          echo "=== 生成刷机用 2MiB dtbo.img（和原厂格式一致，直接刷p10）==="
-          truncate -s 2097152 arch/arm64/boot/dtbo.img
-          dd if="$DTB" of=arch/arm64/boot/dtbo.img bs=512 conv=notrunc
-          ls -lh arch/arm64/boot/dtbo.img
-          # 校验dtbo.img头魔数
-          DTBO_MAGIC="$(od -An -tx4 -N4 arch/arm64/boot/dtbo.img | tr -d ' \n')"
-          if [ "$DTBO_MAGIC" != "0xedfe0dd0" ]; then
-            echo "::error::dtbo.img 头魔数非法：$DTBO_MAGIC"
-            exit 1
-          fi
-          echo "OK   dtbo.img 大小正好2MiB，魔数正确"
-
-      - name: 收集内核模块
+      - name: 校验板级 DTB 魔数
         run: |
           set -euo pipefail
-          cd linux_build
-          echo "=== 安装模块到 staging 目录 ==="
-          INSTALL_MOD_PATH="$(pwd)/../modules"
+          echo "=== 校验板级 DTB ==="
+          cd "$LINUX_BUILD_DIR"
+          DTB_PATH=arch/arm64/boot/dts/hisilicon/gk6323v100c-chaoge-z71a.dtb
+          if [ ! -f "$DTB_PATH" ]; then
+            echo "::error::未找到板级 DTB"
+            exit 1
+          fi
+          MAGIC=$(od -An -tx4 -N4 "$DTB_PATH" | tr -d ' ')
+          if [ "$MAGIC" != "d00dfeed" ]; then
+            echo "::error::DTB 魔数校验失败"
+            exit 1
+          fi
+          echo "OK DTB 校验通过"
+
+      - name: 生成2MiB dtbo.img
+        run: |
+          set -euo pipefail
+          echo "=== 生成2MiB dtbo.img ==="
+          cd "$LINUX_BUILD_DIR"
+          DTB_PATH=arch/arm64/boot/dts/hisilicon/gk6323v100c-chaoge-z71a.dtb
+          truncate -s 2097152 "$DTBO_IMAGE_NAME"
+          dd if="$DTB_PATH" of="$DTBO_IMAGE_NAME" conv=notrunc status=none
+          DTBO_SIZE=$(stat -c%s "$DTBO_IMAGE_NAME")
+          if [ "$DTBO_SIZE" -ne 2097152 ]; then
+            echo "::error::dtbo.img大小错误"
+            exit 1
+          fi
+          echo "OK dtbo.img生成完成"
+
+      - name: 打包内核模块
+        run: |
+          set -euo pipefail
+          echo "=== 打包内核模块 ==="
+          cd "$LINUX_BUILD_DIR"
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          INSTALL_MOD_PATH=$(pwd)/modules_install
           rm -rf "$INSTALL_MOD_PATH"
           mkdir -p "$INSTALL_MOD_PATH"
-          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" INSTALL_MOD_PATH="$INSTALL_MOD_PATH" modules_install
-          rm -f "$INSTALL_MOD_PATH"/lib/modules/*/build "$INSTALL_MOD_PATH"/lib/modules/*/source
-          echo "=== 模块目录结构 ==="
-          ls -lh "$INSTALL_MOD_PATH"/lib/modules/
-          du -sh "$INSTALL_MOD_PATH"
-          echo "=== 打包 modules.tar.gz ==="
-          tar -czf ../modules.tar.gz -C "$INSTALL_MOD_PATH" lib
-          ls -lh ../modules.tar.gz
+          make modules_install INSTALL_MOD_PATH="$INSTALL_MOD_PATH"
+          cd "$INSTALL_MOD_PATH"
+          tar czf "$LINUX_BUILD_DIR/$MODULES_ARCHIVE_NAME" lib/modules
+          echo "OK 模块打包完成"
 
-      - name: 准备发布产物
+      - name: 收集产物
         run: |
           set -euo pipefail
-          cd linux_build
-          mkdir -p ../release
-          cp arch/arm64/boot/uImage       ../release/boot.img
-          cp arch/arm64/boot/dtbo.img     ../release/dtbo.img
-          cp ../modules.tar.gz            ../release/
-          # 附：未打包的裸 dtb，供 dd 手动写盘场景使用
-          cp arch/arm64/boot/dts/hisilicon/gk6323v100c-chaoge-z71a.dtb ../release/gk6323v100c-chaoge-z71a.dtb
-          cd ../release
-          sha256sum * > SHA256SUMS
-          cat SHA256SUMS
+          echo "=== 收集产物 ==="
+          mkdir -p "$OUTPUT_DIR"
+          cd "$LINUX_BUILD_DIR"
+          cp "$BOOT_IMAGE_NAME" "$GITHUB_WORKSPACE/$OUTPUT_DIR/"
+          cp "$DTBO_IMAGE_NAME" "$GITHUB_WORKSPACE/$OUTPUT_DIR/"
+          cp "$MODULES_ARCHIVE_NAME" "$GITHUB_WORKSPACE/$OUTPUT_DIR/"
+          cd "$GITHUB_WORKSPACE/$OUTPUT_DIR"
+          sha256sum * > sha256sums.txt
           ls -lh
+          echo "OUTPUT_DIR_ABS=$GITHUB_WORKSPACE/$OUTPUT_DIR" >> $GITHUB_ENV
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: gk6323v100c-kernel-$
-          path: release/*
+          name: gk6323v100c-kernel-${{ steps.baseline.outputs.kv }}
+          path: ${{ env.OUTPUT_DIR_ABS }}
 
       - name: 发布到 GitHub Release
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
-        runs-on: ubuntu-22.04
-        needs: build-gk6323v100c
-        steps:
-          - name: 下载产物
-            uses: actions/download-artifact@v4
-            with:
-              name: gk6323v100c-kernel-$
-              path: release
-          - name: 创建 Release
-            uses: softprops/action-gh-release@v2
-            with:
-              tag_name: v$
-              name: GK6323V100C 主线内核 $ 自动构建
-              body: |
-                ## 构建信息
-                - 内核版本：**$**
-                - 基线commit：**${{ env.PATCHES_BASE_SHA }}**
-                - 构建时间：${{ github.event.head_commit.timestamp }}
-
-                ## 产物说明
-                | 文件 | 用途 | 刷写分区 |
-                |------|------|----------|
-                | `boot.img` | uImage格式内核镜像（60MB分区） | `/dev/mmcblk0p15`（boot分区） |
-                | `dtbo.img` | 2MB对齐设备树镜像（原厂格式） | `/dev/mmcblk0p10`（dtbo分区） |
-                | `modules.tar.gz` | 内核模块压缩包 | 解压到rootfs的`/`目录 |
-                | `gk6323v100c-chaoge-z71a.dtb` | 裸dtb文件（手动dd用） | 无需刷写 |
-
-                ## 刷写命令（TTL U-Boot下执行）
-                ```bash
-                # 刷设备树
-                tftp 0x02000000 dtbo.img
-                mmc write 0 0x02000000 0x19000 0x1000
-
-                # 刷内核
-                tftp 0x02000000 boot.img
-                mmc write 0 0x02000000 0x38000 0x7800
-
-                # 重启
-                reset
-                ```
-
-                ## 功能说明
-                - ✅ 内置dtb兜底逻辑：不需要修改U-Boot bootcmd，自动识别dtb位置
-                - ✅ 网卡/USB/内置ES8316声卡/eMMC/RTC/看门狗所有外设正常
-                - ✅ 支持USB声卡、USB存储
-                - ✅ EXT4根文件系统、eMMC分区表自动识别
-                - ✅ 内核模块自动加载，不需要手动insmod
-              files: release/*
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.baseline.outputs.kv }}
+          name: GK6323V100C 主线内核 ${{ steps.baseline.outputs.kv }}
+          files: |
+            ${{ env.OUTPUT_DIR_ABS }}/${{ env.BOOT_IMAGE_NAME }}
+            ${{ env.OUTPUT_DIR_ABS }}/${{ env.DTBO_IMAGE_NAME }}
+            ${{ env.OUTPUT_DIR_ABS }}/${{ env.MODULES_ARCHIVE_NAME }}
+            ${{ env.OUTPUT_DIR_ABS }}/sha256sums.txt
