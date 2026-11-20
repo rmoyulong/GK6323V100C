@@ -226,6 +226,48 @@ jobs:
           echo "=== 补丁后确认 ===（本仓库设备树自带，不再要求补丁库含 mv200h 板级 dts）"
           ls arch/arm64/boot/dts/hisilicon/ | head -20 || true
 
+      - name: 移植 Hi3798MV200 支持（CRG 时钟/复位 + FEMAC + USB2 PHY）
+        run: |
+          set -euo pipefail
+          cd linux_build
+          # 根因：GK6323 的 eMMC/FEMAC/USB2 都从 CRG 取时钟，而主线只有
+          # crg-hi3798cv200.c，缺 Hi3798MV200 的 CRG 驱动
+          #（上游原话：the clock driver is the blocker）。
+          # 该支持只存在于 github.com/185264646/linux，MV300 板上已跑通。
+          rm -rf /tmp/mv200
+          git clone --depth=1 --branch wip/trunk \
+            https://github.com/185264646/linux.git /tmp/mv200
+          # 1) CRG 时钟/复位驱动 + PLL
+          cp /tmp/mv200/drivers/clk/hisilicon/crg-hi3798mv200.c drivers/clk/hisilicon/
+          cp /tmp/mv200/drivers/clk/hisilicon/clk-pll.c        drivers/clk/hisilicon/
+          # 2) 时钟/复位 ID 头
+          mkdir -p include/dt-bindings/clock include/dt-bindings/reset
+          cp /tmp/mv200/include/dt-bindings/clock/hisilicon,hi3798mv200-sysctrl.h \
+             include/dt-bindings/clock/ 2>/dev/null || true
+          cp /tmp/mv200/include/dt-bindings/reset/hisilicon,hi3798mv200-reset.h \
+             include/dt-bindings/reset/ 2>/dev/null || true
+          # 3) FEMAC 与 USB2 PHY 的 MV200 支持
+          cp /tmp/mv200/drivers/net/ethernet/hisilicon/hisi_femac.c \
+             drivers/net/ethernet/hisilicon/
+          cp /tmp/mv200/drivers/phy/hisilicon/phy-hisi-inno-usb2.c \
+             drivers/phy/hisilicon/ 2>/dev/null || true
+          # 4) 注册进 Kconfig / Makefile（幂等；Kconfig 选项必须用 tab 缩进）
+          if ! grep -q 'COMMON_CLK_HI3798MV200' drivers/clk/hisilicon/Kconfig; then
+            {
+              echo ''
+              echo 'config COMMON_CLK_HI3798MV200'
+              printf '\tbool "Hi3798MV200 Clock Driver"\n'
+              printf '\tdepends on ARCH_HISI || COMPILE_TEST\n'
+              printf '\tdefault y\n'
+              printf '\tselect MFD_SYSCON\n'
+              printf '\thelp\n'
+              printf '\t  CRG clock and reset driver for Hi3798MV200/MV300.\n'
+            } >> drivers/clk/hisilicon/Kconfig
+          fi
+          grep -q 'crg-hi3798mv200' drivers/clk/hisilicon/Makefile || \
+            echo 'obj-$(CONFIG_COMMON_CLK_HI3798MV200) += crg-hi3798mv200.o clk-pll.o' \
+              >> drivers/clk/hisilicon/Makefile
+          echo "OK   Hi3798MV200 CRG/FEMAC/USB2 支持已移植"
       - name: 应用 GK6323 DTB 兜底启动补丁（照搬 Hi3798MV320 逻辑）
         run: |
           set -euo pipefail
@@ -655,22 +697,89 @@ jobs:
           make -j"$(nproc)" ARCH="$ARCH" CROSS_COMPILE="ccache $CROSS_COMPILE" modules
           ccache -s
 
-      - name: 补全DTS外设硬件节点（网卡/USB/声卡/时钟复位）
+      - name: 按 CRG 补全外设节点（sysctrl/crg + 网卡时钟 + USB2 PHY）
         run: |
           set -euo pipefail
-          # 在dts根节点结束前插入soc总线+所有必要硬件节点
-          if grep -q 'clock-controller@f8a22000' "$BOARD_DTS"; then
-            echo "OK   外设节点已存在，跳过"
-          else
-            # 用单行base64编码避免YAML解析冲突
-            echo "CXNvYyB7CgkJY29tcGF0aWJsZSA9ICJzaW1wbGUtYnVzIjsKCQkjYWRkcmVzcy1jZWxscyA9IDwyPjsKCQkjc2l6ZS1jZWxscyA9IDwyPjsKCQlyYW5nZXM7CgoJCWNydTogY2xvY2stY29udHJvbGxlckBmOGEyMjAwMCB7CgkJCWNvbXBhdGlibGUgPSAiaGlzaWxpY29uLGhpMzc5OG12MjAwLWNydSI7CgkJCXJlZyA9IDwweDAgMHhmOGEyMjAwMCAweDAgMHgxMDAwPjsKCQkJI2Nsb2NrLWNlbGxzID0gPDE+OwoJCQkjcmVzZXQtY2VsbHMgPSA8Mj47CgkJfTsKCgkJdXNiMl9waHk6IHVzYi1waHlAZjk4YzAwMDAgewoJCQljb21wYXRpYmxlID0gImhpc2lsaWNvbixpbm5vLXVzYjItcGh5IjsKCQkJcmVnID0gPDB4MCAweGY5OGMwMDAwIDB4MCAweDEwMDA+OwoJCQkjcGh5LWNlbGxzID0gPDA+OwoJCQljbG9ja3MgPSA8JmNydSAweDEwPjsKCQkJcmVzZXRzID0gPCZjcnUgMHgxOCAweDI+OwoJCX07CgoJCWV0aGVybmV0QGY5YzMwMDAwIHsKCQkJY29tcGF0aWJsZSA9ICJoaXNpbGljb24sZmVtYWMiOwoJCQlyZWcgPSA8MHgwIDB4ZjljMzAwMDAgMHgwIDB4MTAwMD47CgkJCWludGVycnVwdHMgPSA8MCA1NiA0PjsKCQkJY2xvY2tzID0gPCZjcnUgMHg2Mz47CgkJCXJlc2V0cyA9IDwmY3J1IDB4NDUgMHgwPiwgPCZjcnUgMHg0NSAweDI+OwoJCQlyZXNldC1uYW1lcyA9ICJtYWMiLCAiZXBoeXJzdCI7CgkJCXBoeS1tb2RlID0gIm1paSI7CgkJCSNhZGRyZXNzLWNlbGxzID0gPDE+OwoJCQkjc2l6ZS1jZWxscyA9IDwwPjsKCQkJbWRpbyB7CgkJCQkjYWRkcmVzcy1jZWxscyA9IDwxPjsKCQkJCSNzaXplLWNlbGxzID0gPDA+OwoJCQkJZXRocGh5MDogZXRoZXJuZXQtcGh5QDAgewoJCQkJCXJlZyA9IDwwPjsKCQkJCX07CgkJCX07CgkJfTsKCgkJZWhjaUBmOTg5MDAwMCB7CgkJCWNvbXBhdGlibGUgPSAiZ2VuZXJpYy1laGNpIjsKCQkJcmVnID0gPDB4MCAweGY5ODkwMDAwIDB4MCAweDEwMDA+OwoJCQlpbnRlcnJ1cHRzID0gPDAgNjMgND47CgkJCXBoeXMgPSA8JnVzYjJfcGh5PjsKCQkJY2xvY2tzID0gPCZjcnUgMHgwZj47CgkJCXJlc2V0cyA9IDwmY3J1IDB4MTggMHgwPjsKCQl9OwoKCQlvaGNpQGY5ODgwMDAwIHsKCQkJY29tcGF0aWJsZSA9ICJnZW5lcmljLW9oY2kiOwoJCQlyZWcgPSA8MHgwIDB4Zjk4ODAwMDAgMHgwIDB4MTAwMD47CgkJCWludGVycnVwdHMgPSA8MCA2NCA0PjsKCQkJcGh5cyA9IDwmdXNiMl9waHk+OwoJCQljbG9ja3MgPSA8JmNydSAweDBmPjsKCQkJcmVzZXRzID0gPCZjcnUgMHgxOCAweDE+OwoJCX07CgoJCWkyY0BmOWFiMDAwMCB7CgkJCWNvbXBhdGlibGUgPSAiaGl4NWhkMi1pMmMiOwoJCQlyZWcgPSA8MHgwIDB4ZjlhYjAwMDAgMHgwIDB4MTAwMD47CgkJCWludGVycnVwdHMgPSA8MCAzNiA0PjsKCQkJY2xvY2tzID0gPCZjcnUgMHg1Nz47CgkJCSNhZGRyZXNzLWNlbGxzID0gPDE+OwoJCQkjc2l6ZS1jZWxscyA9IDwwPjsKCQkJZXM4MzE2QDEwIHsKCQkJCWNvbXBhdGlibGUgPSAiZXZlcmVzdCxlczgzMTYiOwoJCQkJcmVnID0gPDB4MTA+OwoJCQkJY2xvY2tzID0gPCZjcnUgMHg1OD47CgkJCX07CgkJfTsKCX07Cg==" | base64 -d > /tmp/dts_nodes.dts
-            # 在文件末尾插入节点
-            cat /tmp/dts_nodes.dts >> "$BOARD_DTS"
-            echo "OK   DTS外设硬件节点补全完成"
-          fi
-          # 用dtc预校验语法
-          dtc -I dts -O dtb -o /dev/null "$BOARD_DTS"
-          echo "OK   DTS语法校验通过"
+          # 参考 185264646/linux 的 hi3798mv200.dtsi（MV300 板上已验证）：
+          #   sysctrl@f8a20000 与 crg@f8a22000 提供时钟/复位；
+          #   网卡 femac@f9c30000 的时钟取自 &crg；USB2 PHY 在 0xf9865000。
+          # 注意：compatible 必须是内核里真实存在的
+          #   hisilicon,hi3798mv200-crg / -sysctrl —— 绝不是 *-cru。
+          python3 - "$BOARD_DTS" << 'PYEOF'
+          import re, sys
+          p = sys.argv[1]
+          s = open(p, encoding='utf-8').read()
+
+          # 1) 引入 CRG 的时钟/复位 ID 头
+          if 'hi3798mv200-sysctrl.h' not in s:
+              s = s.replace('/dts-v1/;',
+                  '/dts-v1/;\n#include <dt-bindings/clock/hisilicon,hi3798mv200-sysctrl.h>', 1)
+
+          # 2) 根节点内追加 sysctrl 与 crg（缺时才加，幂等）
+          if 'hi3798mv200-crg' not in s:
+              nodes = '''
+                  sysctrl: system-controller@f8a20000 {
+                      compatible = "hisilicon,hi3798mv200-sysctrl", "syscon";
+                      reg = <0x0 0xf8a20000 0x0 0x1000>;
+                      #clock-cells = <1>;
+                      #reset-cells = <2>;
+                  };
+
+                  crg: clock-reset-controller@f8a22000 {
+                      compatible = "hisilicon,hi3798mv200-crg", "syscon", "simple-mfd";
+                      reg = <0x0 0xf8a22000 0x0 0x1000>;
+                      #clock-cells = <1>;
+                      #reset-cells = <2>;
+                  };
+              '''.replace('    ', '\t')
+              i = s.rstrip().rfind('};')
+              s = s[:i] + nodes + s[i:]
+
+          # 3) 网卡与 MDIO 的时钟改指 &crg（fixed-clock 不会打开硬件门控）
+          s = re.sub(r'(femac: ethernet@f9c30000 \{.*?)clocks = <&clk_75m>;',
+                     r'\1clocks = <&crg HI3798MV200_ETH_CLK>, <&crg HI3798MV200_ETH_BUS_CLK>;',
+                     s, count=1, flags=re.S)
+          s = re.sub(r'(mdio@f9c31100 \{.*?)clocks = <&clk_75m>;',
+                     r'\1clocks = <&crg HI3798MV200_ETH_BUS_CLK>;',
+                     s, count=1, flags=re.S)
+
+          # 4) USB2 PHY 节点 + EHCI/OHCI 的 phys 引用
+          if 'hi3798mv200-usb2-phy' not in s:
+              phy = '''
+                  usb2_phy: usb-phy@f9865000 {
+                      compatible = "hisilicon,hi3798mv200-usb2-phy", "hisilicon,inno-usb2-phy";
+                      reg = <0x0 0xf9865000 0x0 0x1000>;
+                      clocks = <&crg HI3798MV200_USB2_PHY2_REF_CLK>;
+                      resets = <&crg 0xbc 4>;
+                      #address-cells = <1>;
+                      #size-cells = <0>;
+
+                      usb2_phy_port0: phy@0 {
+                          reg = <0x0>;
+                          resets = <&crg 0xbc 8>;
+                          #phy-cells = <0>;
+                      };
+
+                      usb2_phy_port1: phy@1 {
+                          reg = <0x1>;
+                          resets = <&crg 0xbc 9>;
+                          #phy-cells = <0>;
+                      };
+                  };
+              '''.replace('    ', '\t')
+              i = s.rstrip().rfind('};')
+              s = s[:i] + phy + s[i:]
+          s = re.sub(r'(ehci: usb@f9890000 \{)',
+                     r'phys = <&usb2_phy_port0>, <&usb2_phy_port1>;\n\t\t\t\1', s, count=1)
+          s = re.sub(r'(ohci: usb@f9880000 \{)',
+                     r'phys = <&usb2_phy_port0>, <&usb2_phy_port1>;\n\t\t\t\1', s, count=1)
+
+          open(p, 'w', encoding='utf-8').write(s)
+          print('OK  设备树已按 CRG 改写')
+          PYEOF
+          dtc -I dts -O dts -o /dev/null "$BOARD_DTS" > /dev/null 2>&1 || \
+            dtc -I dts -O dtb -o /dev/null "$BOARD_DTS"
+          echo "OK  设备树语法校验通过"
 
       - name: 编译仓库自带的 GK6323V100C 设备树
         run: |
