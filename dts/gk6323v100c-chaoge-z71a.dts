@@ -263,27 +263,29 @@
 		/*
 		 * 板载百兆网口：PHY 挂在下面的 mdio 总线上，地址 2。
 		 *
-		 * resets 两条都要，与补丁库 815-02 的 Hi3798MV200 节点同款：
-		 *   "mac" = PERI_CRG51 @ 0xd0 bit3 —— hisi_femac 对它是强制要求，
-		 *          缺了 probe 直接 -ENOENT（日志里那条 error -2 就是它）；
-		 *   "phy" = PERI_CRG_FEPHY @ 0x388 bit4 —— 内部 FE PHY 的软复位。
-		 *          hisi_femac 里 phy_rst 是可选的（if (priv->phy_rst)），
-		 *          之前没声明它，官方那套「释放→延时→拉低→再释放」的 PHY
-		 *          复位脉冲一次都没跑过，PHY 停在复位态：MDIO 上认得到，
-		 *          但能力寄存器读不出（ethtool 显示 Supported link modes:
-		 *          Not reported、Supports auto-negotiation: No），协商不上，
-		 *          网口一个灯都不亮。
-		 * 只要声明了 "phy"，驱动就会去读 hisilicon,phy-reset-delays-us
-		 * （(预延时, 复位脉宽, 后延时)，单位 us；缺了这个属性 probe 会失败），
-		 * 所以下面三个数必须和 "phy" 一起给。
+		 * resets 只声明 "mac" = PERI_CRG51 @ 0xd0 bit3 —— hisi_femac 对它是
+		 * 强制要求，缺了 probe 直接 -ENOENT（日志里那条 error -2 就是它）。
+		 *
+		 * 有意不声明 "phy"（0x388 bit4）：真机原厂设备树里网卡节点完全没有
+		 * resets，PHY 一直保持 U-Boot 交棒时的状态，原厂内核在同一位置读到
+		 * 的 PHY ID 是 0x20669906（原厂 TTL: "phy_id=0x20669906"）。我们一旦
+		 * 给它声明 "phy"，驱动就会对 0x388 bit4 做一次「断言→延时→释放」，
+		 * 之后 PHY ID 读回 0x00000000 —— MDIO 上地址 2 认得到，但 PHY 芯片
+		 * 不响应（能力寄存器全读不出，ethtool 显示 Supported link modes:
+		 * Not reported、Supports auto-negotiation: No）。这颗是内置 FEPHY，
+		 * bit4 的语义未必与 mv200 相同，在拿到 GK6323 的确切位定义前不去碰它。
+		 *
+		 * phy_rst 在驱动里是可选的（if (priv->phy_rst)），不声明 "phy" 就整段
+		 * 跳过 hisi_femac_phy_reset。hisilicon,phy-reset-delays-us 保留不动：
+		 * 驱动只在 phy_rst 存在时才读它，留着不会报错，也方便以后恢复。
 		 */
 		femac: ethernet@f9c30000 {
 			compatible = "hisilicon,hisi-femac-v2";
 			reg = <0xf9c30000 0x1000>, <0xf9c31300 0x300>;
 			interrupts = <0 72 4>;
 			clocks = <&clk_75m>;
-			resets = <&cru 0xd0 3>, <&cru 0x388 4>;
-			reset-names = "mac", "phy";
+			resets = <&cru 0xd0 3>;
+			reset-names = "mac";
 			hisilicon,phy-reset-delays-us = <10000 10000 500000>;
 			phy-mode = "mii";
 			phy-handle = <&phy2>;
