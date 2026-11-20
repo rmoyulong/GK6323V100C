@@ -230,58 +230,57 @@ jobs:
         run: |
           set -euo pipefail
           cd linux_build
-          mkdir -p patches
-          # 国科 U-Boot bootm 命令存在 arm64 传参 bug：无论传不传第三参，都会强制
-          # 把 ATAGS 地址 0x100 放进 x0 寄存器，不传递 dtb 地址。
-          # 照搬 Hi3798MV320 的解决思路：内核启动第一时间校验 x0 是否为有效 dtb，
-          # 不是则自动从固定加载地址 0x03FFC000 读取 dtb，完全绕开 U-Boot 传参问题。
-          # 效果：不需要修改 bootcmd、不需要 saveenv、不需要手动敲特殊启动命令，
-          # 原厂 bootcmd 自动启动，与原厂内核启动流程完全一致。
-          cat > patches/gk6323-dtb-fallback.patch << 'PATCH_EOF'
-          From: GK6323 Mainline Build <build@gk6323>
-          Subject: [PATCH] arm64: gk6323: add fixed dtb address fallback for broken bootm
+          HS=arch/arm64/kernel/head.S
 
-          U-Boot on GK6323V100C always passes ATAGS address in x0 instead of fdt,
-          causing mainline kernel to hang silently before earlycon init. If x0
-          is not a valid DTB, fall back to the fixed dtb load address 0x03FFC000
-          where U-Boot loads p10 (dtbo partition) by default. This matches the
-          behavior used by HiSilicon Hi3798MV320 vendor kernels for set-top boxes
-          with locked bootloader.
+          # ★ 这里不再用「手写 diff + patch」的办法。手写补丁每增删一行都要人工同步
+          #   @@ 头里的行数与 "N insertions(+)"；写错一行，patch 就当头报
+          #     malformed patch at line NN
+          #   并直接退出，后面的检查一个字都不跑（2026-11-20 那次构建就是如此：
+          #   hunk 头写 @@ -88,6 +88,16 @@，正文却插了 11 行，正确应为 +88,17）。
+          #   改成脚本插入：不涉及行数计数，带幂等哨兵，重复跑只插一次；
+          #   锚点不唯一时直接中止，不做「猜一个位置硬插」。
+          #
+          #   寄存器只用 x20/x21，**绝不碰 x19**：
+          #   x19 由上一行的 record_mmu_state 写入，保存「进内核时 MMU 是否已开」，
+          #   后面 cbnz x19 / mov x0, x19 还要读它。早前那版补丁写 mov x19, x0，
+          #   把 x19 覆盖掉 —— 即使补丁打上了，内核也会走错缓存维护分支。
+          #
+          #   0x03FFC000 的构造必须「低位 movz + 高位 movk」：
+          #     movz x0, #0xc000           → x0 = 0x0000C000
+          #     movk x0, #0x03ff, lsl #16  → x0 = 0x03FFC000
+          #   早前那版写成 movz #0xc000, lsl #16 再 movk #0x03ff, lsl #16，
+          #   两条都左移 16，实际得到的是 0x03FF0000（差了 0xC000），
+          #   内核照样找不到 dtb。
+          if grep -q 'GK6323_DTB_FALLBACK' "$HS"; then
+            echo "OK   已存在 DTB 兜底代码，跳过插入"
+          else
+            N="$(grep -cE '^[[:space:]]*bl[[:space:]]+preserve_boot_args[[:space:]]*$' "$HS" || true)"
+            if [ "$N" -ne 1 ]; then
+              echo "::error::head.S 里 bl preserve_boot_args 出现 $N 次（期望 1 次），拒绝盲目插入"
+              exit 1
+            fi
+            # 用 printf %b 生成带真 tab 的汇编片段：不经 heredoc、不经 yaml 缩进剥离，
+            # 避免「复制粘贴把行首 tab 吃掉」这类只能靠肉眼发现的破坏。
+            printf '%b\n' \
+              '\t/* GK6323_DTB_FALLBACK: U-Boot passes ATAGS addr in x0; if x0 is not a valid FDT, use 0x03FFC000 */' \
+              '\tldr\tw20, [x0]' \
+              '\tmovz\tw21, #0xd00d, lsl #16' \
+              '\tmovk\tw21, #0xfeed' \
+              '\tcmp\tw20, w21' \
+              '\tb.eq\t1f' \
+              '\tmovz\tx0, #0xc000' \
+              '\tmovk\tx0, #0x03ff, lsl #16' \
+              '1:' > /tmp/gk6323-ins.S
+            awk 'FNR==NR{ins=ins $0 ORS; next}
+                 /^[[:space:]]*bl[[:space:]]+preserve_boot_args[[:space:]]*$/ && !d {printf "%s", ins; d=1}
+                 {print}' /tmp/gk6323-ins.S "$HS" > "$HS.new"
+            mv "$HS.new" "$HS"
+            echo "OK   DTB 兜底代码已插入"
+          fi
 
-          Signed-off-by: GK6323 Mainline Build <build@gk6323>
-          ---
-           arch/arm64/kernel/head.S | 10 ++++++++++
-           1 file changed, 10 insertions(+)
-
-          diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
-          index 51a09c8b4d37..7e2f9a3d1c45 100644
-          --- a/arch/arm64/kernel/head.S
-          +++ b/arch/arm64/kernel/head.S
-          @@ -88,6 +88,16 @@ SYM_CODE_START(primary_entry)
-           	bl	__pi_set_ctxt				// set TPIDR_EL1
-           #endif
-           	bl	record_mmu_state
-          +	/* GK6323 broken bootm fallback: if x0 is not valid FDT, use fixed address */
-          +	mov	x19, x0
-          +	ldr	w20, [x0]
-          +	movz	w21, #0xd00d, lsl #16
-          +	movk	w21, #0xfeed
-          +	cmp	w20, w21
-          +	b.eq	.L_gk6323_dtb_ok
-          +	movz	x19, #0xc000, lsl #16
-          +	movk	x19, #0x03ff, lsl #16		/* 0x03FFC000 = dtb load address */
-          +.L_gk6323_dtb_ok:
-          +	mov	x0, x19
-           	bl	preserve_boot_args
-           	bl	init_kernel_el			// w0=cpu_boot_mode
-           	mov	x20, x0				// preserve bootargs
-          PATCH_EOF
-          # 去掉补丁每行前的yaml缩进，还原成标准patch格式
-          sed -i 's/^          //' patches/gk6323-dtb-fallback.patch
-          patch -p1 --dry-run < patches/gk6323-dtb-fallback.patch
-          patch -p1 < patches/gk6323-dtb-fallback.patch
-          echo "=== DTB 兜底补丁已应用 ==="
-          echo "启动逻辑：内核第一时间校验 x0 中的 dtb 魔数（0xd00dfeed），无效则自动读取 0x03FFC000（p10固定加载地址）"
+          # 插入结果原样打印，便于核对寄存器与地址
+          grep -n -B2 -A11 'GK6323_DTB_FALLBACK' "$HS" || true
+          echo "启动逻辑：内核第一时间校验 x0 中的 dtb 魔数（0xd00dfeed），无效则自动读取 0x03FFC000（p10 固定加载地址）"
 
       - name: 部署内核配置并强制关键驱动内置
         run: |
@@ -863,6 +862,19 @@ jobs:
           cp arch/arm64/boot/Image out/Image
           # 单独发一份 dtb：真机运行时的设备树来自 dtbo 分区，这一份必须写入 p10
           cp "arch/arm64/boot/dts/hisilicon/$TARGET_DTB" out/
+          # 刷机包格式的 dtbo.img：正好 2MiB（= p10 分区大小），全零补齐后再把 dtb 覆盖到开头。
+          #   与作者原厂 dtbo.img 逐字节同构（原厂：dtb 9156 字节 + 全零补到 2MiB）。
+          #   TTL 刷机时可以直接 tftp 整块写 p10，不必再自己算 dtb 实际长度、也不必先擦。
+          DTBO_BYTES=$((2 * 1024 * 1024))
+          dd if=/dev/zero of="out/dtbo.img" bs=4096 count=$((DTBO_BYTES / 4096)) status=none
+          dd if="out/$TARGET_DTB" of="out/dtbo.img" conv=notrunc status=none
+          DTBO_SZ=$(stat -c%s "out/dtbo.img")
+          [ "$DTBO_SZ" -eq "$DTBO_BYTES" ] || { echo "::error::dtbo.img 大小 $DTBO_SZ != $DTBO_BYTES"; exit 1; }
+          DTBO_MAGIC=$(od -A n -t x1 -N 4 "out/dtbo.img" | tr -d ' \n\t')
+          [ "$DTBO_MAGIC" = "d00dfeed" ] || { echo "::error::dtbo.img 魔数 $DTBO_MAGIC != d00dfeed"; exit 1; }
+          DTBO_TOTAL=$(od -A n --endian=big -t u4 -j 4 -N 4 "out/dtbo.img" | tr -d ' \n\t')
+          [ "$DTBO_TOTAL" -eq "$(stat -c%s "out/$TARGET_DTB")" ] || { echo "::error::dtbo.img 里的 FDT totalsize=$DTBO_TOTAL 与 dtb 文件大小不符"; exit 1; }
+          echo "dtbo.img：$DTBO_SZ 字节（2MiB），FDT totalsize=$DTBO_TOTAL，内嵌 dtb 与 out/$TARGET_DTB 同源"
           cp .config "out/config-$KREL"
           make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" INSTALL_MOD_PATH="$PWD/out/_mod" modules_install
           rm -f out/_mod/lib/modules/*/build out/_mod/lib/modules/*/source
@@ -870,7 +882,7 @@ jobs:
           rm -rf out/_mod
           # 生成校验清单，便于上机前后核对
           cd out
-          sha256sum boot.img modules.tar.gz Image "$TARGET_DTB" "config-$KREL" > sha256sums.txt
+          sha256sum boot.img dtbo.img modules.tar.gz Image "$TARGET_DTB" "config-$KREL" > sha256sums.txt
           cat sha256sums.txt
           echo "内核 release: $KREL"
           echo "=== 产物列表 ==="
@@ -917,7 +929,8 @@ jobs:
           | 文件 | 用途 |
           | --- | --- |
           | boot.img | 内核镜像，写入 p15（boot）分区 |
-          | @DTB_NAME@ | 设备树，写入 p10（dtbo）分区 |
+          | @DTB_NAME@ | 设备树原文件，可 `dd` 写入 p10（dtbo）分区 |
+          | dtbo.img | 2MiB 刷机包格式设备树（dtb + 全零补齐），TTL 下可整块 `tftp` + `mmc write` 写 p10 |
           | modules.tar.gz | 内核模块（含 USB 音频），解压到根目录 / |
           | Image | 未打包的裸内核，仅供核对 |
           | config-* | 本次实际使用的内核配置 |
@@ -929,7 +942,8 @@ jobs:
           sudo dd if=/dev/mmcblk0p15 of=/root/boot.bak bs=1M conv=fsync
           2. 先解压模块：`cd / && sudo tar -xzf /tmp/modules.tar.gz && sync`
           3. 刷内核：`sudo dd if=/tmp/boot.img of=/dev/mmcblk0p15 bs=1M conv=fsync && sync`
-          4. **刷设备树（必须）**：`sudo dd if=/tmp/@DTB_NAME@ of=/dev/mmcblk0p10 bs=1K conv=fsync && sync`
+          4. **刷设备树（必须）**：`sudo dd if=/tmp/dtbo.img of=/dev/mmcblk0p10 bs=1M conv=fsync && sync`
+             （也可用 @DTB_NAME@：`sudo dd if=/tmp/@DTB_NAME@ of=/dev/mmcblk0p10 bs=1K conv=fsync && sync`）
           5. 重启：`sudo reboot`
 
           或使用脚本：
@@ -970,6 +984,7 @@ jobs:
           artifactErrorsFailBuild: true
           files: |
             linux_build/out/boot.img
+            linux_build/out/dtbo.img
             linux_build/out/${{ env.TARGET_DTB }}
             linux_build/out/modules.tar.gz
             linux_build/out/Image
