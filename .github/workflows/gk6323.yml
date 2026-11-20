@@ -78,7 +78,7 @@ jobs:
       BOARD_DTS: dts/gk6323v100c-chaoge-z71a.dts
       TARGET_DTB: gk6323v100c-chaoge-z71a.dtb
       # 单板配置层
-      FRAGMENT: gk6323v100c.config
+      FRAGMENT: kernel.config
       # 实机分区：boot 起始 112M、长 60M；dtbo 起始 50M、长 2M
       BOOT_PART: /dev/mmcblk0p15
       BOOT_PART_LIMIT_MB: "60"
