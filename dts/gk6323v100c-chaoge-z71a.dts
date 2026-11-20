@@ -1,28 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * 国科微 GK6323V100C（整机型号 ChaoGe Z71A）板级设备树
+ * 国科微 GK6323V100C（整机型号 ChaoGe Z71A）板级设备树 —— 引导最小集
  *
- * 本版关键改动（相对引导最小集）：
- *   1) 修正 soc 的 ranges 翻译（之前 4-cell 格式写错，导致 /soc 在 proc 下消失），
- *      外设统一写成 soc 内偏移地址，由 ranges 映射到 0xf0000000 物理段；
- *   2) 加入 Hi3798MV200 同源的 CRG 时钟复位控制器（f8a22000），主线驱动
- *      hisilicon,hi3798mv200-crg 会在 of_clk_init 阶段绑定；
- *   3) eMMC / FEMAC / MDIO / EHCI / OHCI / USB2-PHY 全部接上 CRG 的 clocks/resets，
- *      替换原来的 fixed-clock——fixed-clock 只能提供频率，打不开硬件门控和复位；
- *   4) 增加 usb2_phy1 节点（INNO USB2 PHY，f9865000），EHCI/OHCI 必须通过 phys
- *      属性引用 PHY 端口，否则 h/w reset 无法释放、必报 -110/-75；
- *   5) 网卡 compatible 改为主线认的 "hisilicon,hi3798mv200-femac","hisilicon,hisi-femac"，
- *      eMMC 改为 "hisilicon,hi3798mv200-dw-mshc" 让主线 dw_mmc 认领。
+ * 数据来源：真机原厂内核导出的 /sys/firmware/devicetree/base，逐项对齐，
+ * 没有臆造参数。真机实测为 4×Cortex-A55（part 0xd05）+ GICv3 + 国科私有 CRU，
+ * 不是海思的 A53 + GIC-400，所以本文件不是海思 mv200h 板级的照抄。
  *
- * 时钟/复位编号取自补丁库 410-01 的 dt-bindings/clock/hisilicon,hi3798mv200-crg.h
- * 与 915-02 的 hi3798mv200.dtsi，直接写成数字（GitHub Actions 里的 dtc 不跑
- * C 预处理器，无法处理 #include），数字值与宏一一对应，注释里保留宏名便于核对。
+ * 为什么只有这些节点 —— 引导器读了 16KiB 就收手：
+ *   U-Boot 的 bootcmd 是
+ *     mmc read 0 0x03FFC000 0x19000 0x20
+ *   即从 dtbo 分区（起始块 0x19000）只读 0x20 = 32 块 = 16KiB 到 0x03FFC000，
+ *   这个地址紧贴内核加载地址 0x04000000 之下。设备树超过 16KiB 就会被截断，
+ *   内核解析失败 → 起不来。作者那版 dtbo 里的 dtb 只有 9156 字节。
+ *   所以本文件只保留「点亮系统所必需」的节点，其余一律不写：
+ *     串口控制台(uart0) / eMMC / 复位看门狗 / USB 主控 / 网口 / RTC
  *
- * 没加的（保持 dtb 体积，后续再补）：AIAO/ES8316 声卡、GPIO×8、uart2/3、i2c0/1、
- *   SDIO、IR、GPU。先把根文件系统依赖的 eMMC、远程调试用的网口、USB 三项点亮。
+ * 本次相对上一版删掉的（引导用不到，需要时再加回来）：
+ *   GPIO×8（PL061，无任何消费者）、uart2、uart3、i2c0、i2c1、spi0、
+ *   chosen 下的 simple-framebuffer、vdp 保留内存，
+ *   aliases 中除 serial0 以外的全部别名，以及根 compatible 的第三串。
  *
- * 真机硬件事实保留：Cortex-A55 (part 0xd05) ×4、GICv3、PSCI-0.2、2GiB 内存、
- *   U-Boot 加载 DTB 上限 16KiB（作者版 dtb=9156 字节）。
+ * 与真机原树的有意差异（让主线内核能认领硬件）：
+ *   1) eMMC 的 compatible 追加 "snps,dw-mshc"，使主线 dw_mmc-pltfm 能够认领
+ *      （原 compatible 是国科 BSP 私有名，主线无此驱动）；
+ *   2) 各外设时钟改指下面的 fixed-clock，不再引用国科私有 CRU —— 主线没有
+ *      该 CRU 驱动，继续引用会让外设 probe 时永久 -EPROBE_DEFER；
+ *   3) 真机树里主线无驱动的节点（aiao 音频、cpufreq、thermal、ir、cru）不写。
+ *
+ * 中断 specifier：GICv3 为 3 个 cell = <类型 号 触发方式>，类型 0=SPI、1=PPI，
+ * 号是 GIC 视角的号（SPI 号 = 真机 /proc/interrupts 里的号 - 32）。
  */
 
 /dts-v1/;
@@ -34,20 +40,33 @@
 	#size-cells = <2>;
 	interrupt-parent = <&gic>;
 
+	/* stdout-path = "serial0:..." 依赖这条别名，其余别名引导用不到 */
 	aliases {
 		serial0 = &uart0;
 	};
 
 	chosen {
+		/* 与 bootargs 分区一致；root= 亦由此下发 */
 		bootargs = "earlycon=pl011,mmio32,0xf8b00000,115200n8 console=ttyAMA0,115200n8 console=tty0 clk_ignore_unused net.ifnames=0 root=/dev/mmcblk0p18 rootfstype=ext4 rootwait rw panic=-1 blkdevparts=mmcblk0:1M(fastboot),512K(bootargs),512K(bootargsbak),20M(recovery),2M(deviceinfo),8M(securestore),2M(atf),8M(baseparam),8M(pqparam),2M(dtbo),10M(logo),10M(logobak),20M(fastplay),20M(recoverybak),60M(boot),20M(misc),20M(trustedcore),-(rootfs)";
 		stdout-path = "serial0:115200n8";
 	};
 
+	/*
+	 * 内存：2GiB，取自**真机导出的设备树**（hwinfo/hw1.txt 里的
+	 *   memory@0 { reg = <0x00 0x00 0x00 0x80000000>; }）
+	 * 与真机 /proc/meminfo 的 MemTotal: 2018984 kB，两者吻合。
+	 * ★ 不要被 U-Boot 那两行 "DRAM: 1 GiB" / "DDR Size: 1 GiB (Boot: 1 GiB)"
+	 *   误导：那是 U-Boot 自己的可映射上限（它启动内核只需 1GiB 就够），
+	 *   不代表硬件容量。写成 1GiB 会让内核白白少认一半内存。
+	 * 作者那版的 vdp@7f000000(2032MB) 与 framebuffer@7f511000 都在 2GiB 内，
+	 * 但本机第一阶段不用显示与硬解，故不写。
+	 */
 	memory@0 {
 		device_type = "memory";
 		reg = <0x00 0x00 0x00 0x80000000>;
 	};
 
+	/* BL31(ATF) 与 OPTEE 占用区，必须告知内核，否则会被当作可用内存 */
 	reserved-memory {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -64,11 +83,25 @@
 		};
 	};
 
-	/* 24MHz 晶振，给不经过 CRG 门控的辅助路径 */
-	clk_24m: clk-24m {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <24000000>;
+	/* 国科 CRU 无主线驱动，外设时钟一律用固定时钟，由 bootloader 保持上电 */
+	clocks {
+		clk_24m: clk-24m {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <24000000>;
+		};
+
+		clk_50m: clk-50m {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <50000000>;
+		};
+
+		clk_75m: clk-75m {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <75000000>;
+		};
 	};
 
 	cpus {
@@ -80,7 +113,6 @@
 			compatible = "arm,cortex-a55";
 			reg = <0x0>;
 			enable-method = "psci";
-			clocks = <&crg 10>; /* HI3798MV200_CPU_CLK */
 		};
 
 		cpu1: cpu@100 {
@@ -88,7 +120,6 @@
 			compatible = "arm,cortex-a55";
 			reg = <0x100>;
 			enable-method = "psci";
-			clocks = <&crg 10>;
 		};
 
 		cpu2: cpu@200 {
@@ -96,7 +127,6 @@
 			compatible = "arm,cortex-a55";
 			reg = <0x200>;
 			enable-method = "psci";
-			clocks = <&crg 10>;
 		};
 
 		cpu3: cpu@300 {
@@ -104,7 +134,6 @@
 			compatible = "arm,cortex-a55";
 			reg = <0x300>;
 			enable-method = "psci";
-			clocks = <&crg 10>;
 		};
 	};
 
@@ -113,6 +142,7 @@
 		method = "smc";
 	};
 
+	/* A55 的 arch timer：4 个 PPI，频率 24MHz（与真机一致） */
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupts = <1 13 4>, <1 14 4>, <1 11 4>, <1 10 4>;
@@ -128,37 +158,27 @@
 	};
 
 	soc: soc@f0000000 {
-		compatible = "simple-bus";
 		#address-cells = <1>;
 		#size-cells = <1>;
-		/* 子地址 1 cell → 父地址 2 cell + 大小 2 cell；0x0..0xfffffff 映射到 0xf0000000 */
-		ranges = <0x0 0x0 0xf0000000 0x10000000>;
+		compatible = "simple-bus";
+		ranges = <0xf0000000 0x0 0xf0000000 0x10000000>;
 
-		/*
-		 * Hi3798MV200 同源 CRG 时钟复位控制器（原厂 TTL: gk6323v100c-cru f8a22000.clock）
-		 * compatible 双写 hisilicon,hi3798mv200-crg 让主线 CRG 驱动绑定；
-		 * #clock-cells = <1> 用于 <&crg CLK_ID>；#reset-cells = <2> 用于 <&crg offset bit>。
-		 */
-		crg: clock-reset-controller@8a22000 {
-			compatible = "hisilicon,hi3798mv200-crg", "syscon", "simple-mfd";
-			reg = <0x8a22000 0x1000>;
-			#clock-cells = <1>;
-			#reset-cells = <2>;
-		};
-
-		uart0: serial@8b00000 {
+		/* 控制台串口：bootargs 的 console=ttyAMA0 指这里 */
+		uart0: serial@f8b00000 {
 			compatible = "arm,pl011", "arm,primecell";
-			reg = <0x8b00000 0x1000>;
+			reg = <0xf8b00000 0x1000>;
 			interrupts = <0 49 4>;
-			clocks = <&clk_24m>, <&crg 1>; /* uartclk, APB_CLK */
+			clocks = <&clk_75m>, <&clk_75m>;
 			clock-names = "uartclk", "apb_pclk";
 		};
 
-		i2c2: i2c@8b12000 {
+		/* 板载 RTC：PCF8563 挂在 i2c2 上，地址 0x51 */
+		i2c2: i2c@f8b12000 {
 			compatible = "hisilicon,hix5hd2-i2c";
-			reg = <0x8b12000 0x1000>;
+			reg = <0xf8b12000 0x1000>;
 			interrupts = <0 40 4>;
-			clocks = <&crg 27>; /* HI3798MV200_I2C2_CLK */
+			clocks = <&clk_50m>;
+			clock-names = "apb_pclk";
 			clock-frequency = <100000>;
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -169,34 +189,17 @@
 			};
 		};
 
-		watchdog@8a2c000 {
-			compatible = "arm,sp805", "arm,primecell";
-			arm,primecell-periphid = <0x00141805>;
-			reg = <0x8a2c000 0x1000>;
-			interrupts = <0 29 4>;
-			clocks = <&crg 132>, <&crg 1>; /* WDG0_CLK, APB_CLK */
-			clock-names = "wdog_clk", "apb_pclk";
-			resets = <&crg 0x178 4>; /* PERI_CRG94 bit 4 */
-			timeout-sec = <60>;
-		};
-
 		/*
-		 * eMMC（根文件系统）。clocks/resets 与主线 hi3798mv200.dtsi 的 emmc 节点一致：
-		 *   CIU=48, BIU=47, SAMPLE=50, DRV=51；reset = PERI_CRG40(0xa0) bit 4
+		 * eMMC：根文件系统在 mmcblk0p18，本项必须起来。
+		 * 第二段 reg 是国科 CRU 里那 0x40 字节的 SD 时钟控制寄存器，保留原位，
+		 * 主线驱动不会去动它（时钟由 bootloader 保持上电）。
 		 */
-		emmc: mmc@9830000 {
-			compatible = "hisilicon,hi3798mv200-dw-mshc";
-			reg = <0x9830000 0x10000>;
+		emmc: mmc@f9830000 {
+			compatible = "goke,gk6323v100c-dw-mshc", "snps,dw-mshc";
+			reg = <0xf9830000 0x1000>, <0xf8a21000 0x40>;
 			interrupts = <0 35 4>;
-			clocks = <&crg 48>, <&crg 47>, <&crg 50>, <&crg 51>;
-			clock-names = "ciu", "biu", "ciu-sample", "ciu-drive";
-			resets = <&crg 0xa0 4>;
-			reset-names = "reset";
-			clk-phase-mmc-hs = <315 180>;
-			clk-phase-mmc-hs200 = <90 90>;
-			clk-phase-mmc-hs400 = <90 90>;
-			clk-phase-mmc-ddr52 = <90 90>;
-			hisilicon,sap-dll-reg = <&crg 0x39c>;
+			clocks = <&clk_50m>, <&clk_50m>;
+			clock-names = "biu", "ciu";
 			fifo-depth = <0x100>;
 			card-detect-delay = <200>;
 			bus-width = <8>;
@@ -205,90 +208,49 @@
 			disable-wp;
 		};
 
-		/*
-		 * INNO USB2 PHY（覆盖两个主机端口），基址 0x9865000，与主线 hi3798mv200.dtsi
-		 * 中 usb2_phy1 一致；port0→OHCI，port1→EHCI。
-		 *   ref clock = USB2_PHY1_REF_CLK(71); reset = 0xbc bit 4;
-		 *   port0 reset = 0xbc bit 8; port1 reset = 0xbc bit 9
-		 */
-		usb2_phy1: usb-phy@9865000 {
-			compatible = "hisilicon,hi3798mv200-usb2-phy";
-			reg = <0x9865000 0x800>;
-			clocks = <&crg 71>;
-			resets = <&crg 0xbc 4>;
+		/* 板载百兆网口：PHY 挂在下面的 mdio 总线上，地址 2 */
+		femac: ethernet@f9c30000 {
+			compatible = "hisilicon,hisi-femac-v2";
+			reg = <0xf9c30000 0x1000>, <0xf9c31300 0x300>;
+			interrupts = <0 72 4>;
+			clocks = <&clk_75m>;
+			phy-mode = "mii";
+			phy-handle = <&phy2>;
+		};
+
+		mdio@f9c31100 {
+			compatible = "hisilicon,hisi-femac-mdio";
+			reg = <0xf9c31100 0x100>;
+			clocks = <&clk_75m>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			usb2_phy1_port0: phy@0 {
-				reg = <0>;
-				resets = <&crg 0xbc 8>;
-				#phy-cells = <0>;
-			};
-
-			usb2_phy1_port1: phy@1 {
-				reg = <1>;
-				resets = <&crg 0xbc 9>;
-				#phy-cells = <0>;
+			phy2: ethernet-phy@2 {
+				reg = <0x2>;
 			};
 		};
 
-		/*
-		 * OHCI：BUS_CLK=63, 12M_CLK=65, 48M_CLK=64；reset=0xb8 bit 12；挂 port0
-		 */
-		ohci: usb@9880000 {
+		/* USB2.0：真机只有 EHCI/OHCI，无 xhci */
+		ohci: usb@f9880000 {
 			compatible = "generic-ohci";
-			reg = <0x9880000 0x10000>;
+			reg = <0xf9880000 0x10000>;
 			interrupts = <0 67 4>;
-			clocks = <&crg 63>, <&crg 65>, <&crg 64>;
-			resets = <&crg 0xb8 12>;
-			phys = <&usb2_phy1_port0>;
 		};
 
-		/*
-		 * EHCI：BUS_CLK=63, HST_PHY_CLK=67, UTMI0=68, UTMI1=69；
-		 * resets = 0xb8 bit 12(软)/13/14/16；挂 port1
-		 */
-		ehci: usb@9890000 {
+		ehci: usb@f9890000 {
 			compatible = "generic-ehci";
-			reg = <0x9890000 0x10000>;
+			reg = <0xf9890000 0x10000>;
 			interrupts = <0 66 4>;
-			clocks = <&crg 63>, <&crg 67>, <&crg 68>, <&crg 69>;
-			resets = <&crg 0xb8 12>, <&crg 0xb8 16>, <&crg 0xb8 13>, <&crg 0xb8 14>;
-			phys = <&usb2_phy1_port1>;
 		};
 
-		/*
-		 * FEMAC 百兆网口：ETH_CLK=84, ETH_BUS_CLK=83, FEPHY_CLK=178；
-		 * mac reset = PERI_CRG52(0xd0) bit 3；phy reset = PERI_CRG226(0x388) bit 4。
-		 * PHY 地址按真机是 2（原厂 TTL: "Generic PHY (2)"）。
-		 */
-		femac: ethernet@9c30000 {
-			compatible = "hisilicon,hi3798mv200-femac", "hisilicon,hisi-femac";
-			reg = <0x9c30000 0x1000>, <0x9c31300 0x200>;
-			interrupts = <0 72 4>;
-			#address-cells = <1>;
-			#size-cells = <1>;
-			ranges = <0x0 0x9c30000 0x10000>;
-			clocks = <&crg 84>, <&crg 83>, <&crg 178>;
-			clock-names = "mac", "macif", "phy";
-			resets = <&crg 0xd0 3>, <&crg 0x388 4>;
-			reset-names = "mac", "phy";
-			phy-handle = <&fephy>;
-			phy-mode = "mii";
-			phy-connection-type = "mii";
-			hisilicon,phy-reset-delays-us = <10000 10000 500000>;
-
-			mdio: mdio@1100 {
-				compatible = "hisilicon,hisi-femac-mdio";
-				reg = <0x1100 0x20>;
-				#address-cells = <1>;
-				#size-cells = <0>;
-
-				fephy: ethernet-phy@2 {
-					reg = <2>;
-					#phy-cells = <0>;
-				};
-			};
+		/* SP805 看门狗：也是 panic 后重启的复位通道 */
+		watchdog@f8a2c000 {
+			compatible = "arm,sp805-wdt", "arm,primecell";
+			reg = <0xf8a2c000 0x1000>;
+			clocks = <&clk_24m>;
+			clock-names = "apb_pclk";
+			clock-frequency = <24000000>;
+			timeout-sec = <60>;
 		};
 	};
 };
