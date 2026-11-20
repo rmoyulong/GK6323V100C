@@ -1,0 +1,311 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GK6323 Mainline Port <mainline@gk6323.local>
+Date: Fri, 20 Nov 2026 23:00:00 +0800
+Subject: [PATCH] clk: hisilicon: add GK6323V100C minimal CRG driver source and headers
+
+Add the source file and dt-bindings headers for the GK6323V100C
+minimal CRG (Clock/Reset Generator) driver.
+
+Kconfig and Makefile entries are appended by the workflow shell
+step (not by this patch), because the hisilicon clk Kconfig/Makefile
+already exist on mainline and patch-hunk line numbers would be
+brittle across kernel versions.
+
+Only three verified peripheral groups are exposed:
+  - eMMC (dw-mmc):       PERI_CRG40 @ 0x0a0
+  - USB2 EHCI/OHCI:      PERI_CRG46 @ 0x0b8, PERI_CRG47 @ 0x0bc
+  - FEMAC ethernet:      PERI_CRG51 @ 0x0cc, PERI_CRG52 @ 0x0d0
+
+PLL, I2C, IR, SPI, AIAO, VDM/GPU clocks are intentionally NOT
+registered to avoid writing to un-verified registers, which has
+caused boot hangs (black screen) on the board.  All PLLs are left
+in the state configured by U-Boot.
+
+The driver uses arch_initcall_sync so it probes after the console
+is up.  It probes against the "goke,gk6323v100c-crg" compatible
+string.
+
+Register base f8a22000 and bit positions are cross-verified against
+the vendor device tree (GK6323V100C dtbo partition) and the
+HiSTBLinux Hi3798MV310 BSP source (clk-hi3798mv310.c), both of
+which match the vendor TTL log line:
+  gk6323v100c-cru f8a22000.clock: gk6323v100c: ...
+
+Signed-off-by: GK6323 Mainline Port <mainline@gk6323.local>
+---
+ drivers/clk/hisilicon/crg-gk6323v100c.c        | 218 ++++++++++++++++++
+ include/dt-bindings/clock/gk6323v100c-crg.h    |  23 ++
+ include/dt-bindings/reset/gk6323v100c-resets.h |  20 ++
+ 3 files changed, 261 insertions(+)
+ create mode 100644 drivers/clk/hisilicon/crg-gk6323v100c.c
+ create mode 100644 include/dt-bindings/clock/gk6323v100c-crg.h
+ create mode 100644 include/dt-bindings/reset/gk6323v100c-resets.h
+
+diff --git a/drivers/clk/hisilicon/crg-gk6323v100c.c b/drivers/clk/hisilicon/crg-gk6323v100c.c
+new file mode 100644
+index 000000000000..aaaaaaaaaaa
+--- /dev/null
++++ b/drivers/clk/hisilicon/crg-gk6323v100c.c
+@@ -0,0 +1,218 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * GK6323V100C minimal CRG (Clock/Reset Generator) driver
++ *
++ * Only registers three verified peripheral groups:
++ *   - eMMC (dw-mmc):       PERI_CRG40 @ 0x0a0
++ *   - USB2 EHCI/OHCI:      PERI_CRG46 @ 0x0b8, PERI_CRG47 @ 0x0bc
++ *   - FEMAC ethernet:      PERI_CRG51 @ 0x0cc, PERI_CRG52 @ 0x0d0
++ *
++ * PLLs and unverified gate clocks are intentionally left alone;
++ * U-Boot has already configured them, we just enable gates and
++ * release resets for the three peripherals above.
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/reset-controller.h>
++#include <linux/regmap.h>
++#include <linux/mfd/syscon.h>
++#include <dt-bindings/clock/gk6323v100c-crg.h>
++#include <dt-bindings/reset/gk6323v100c-resets.h>
++
++struct gk_gate_clock {
++	const char *name;
++	const char *parent_name;
++	u32 reg_offset;
++	u8 gate_bit;
++	unsigned long flags;
++};
++
++static const struct gk_gate_clock gk_crg_clks[] = {
++	[GK6323_CLK_MCI_BUS]     = { "mci0_bus",    "osc24m", 0xa0, 0, CLK_SET_RATE_PARENT },
++	[GK6323_CLK_MCI_CIU]     = { "mci0_ciu",    "osc24m", 0xa0, 1, CLK_SET_RATE_PARENT },
++	[GK6323_CLK_USB2_BUS]    = { "usb2_bus",    "osc24m", 0xb8, 0, 0 },
++	[GK6323_CLK_USB2_OHCI]   = { "usb2_ohci",   "osc24m", 0xb8, 1, 0 },
++	[GK6323_CLK_USB2_HSTPHY] = { "usb2_hstphy", "osc24m", 0xb8, 4, 0 },
++	[GK6323_CLK_USB2_UTMI0]  = { "usb2_utmi0",  "osc24m", 0xb8, 5, 0 },
++	[GK6323_CLK_USB2_PHY_REF]= { "usb2_phy_ref","osc24m", 0xbc, 0, 0 },
++	[GK6323_CLK_FEMAC_BUS]   = { "femac_bus",   "osc24m", 0xcc, 0, 0 },
++	[GK6323_CLK_FEMAC_IF]    = { "femac_if",    "osc24m", 0xd0, 0, CLK_SET_RATE_PARENT },
++};
++
++#define GK_CRG_NR_CLKS		ARRAY_SIZE(gk_crg_clks)
++
++struct gk_reset_desc {
++	u32 reg_offset;
++	u8 reset_bit;
++};
++
++static const struct gk_reset_desc gk_crg_resets[] = {
++	[GK6323_RST_MCI0]         = { 0xa0, 4  },
++	[GK6323_RST_USB2_HST]     = { 0xb8, 12 },
++	[GK6323_RST_USB2_UTMI0]   = { 0xb8, 13 },
++	[GK6323_RST_USB2_PHY]     = { 0xbc, 4  },
++	[GK6323_RST_USB2_PORT0]   = { 0xbc, 8  },
++	[GK6323_RST_FEMAC_BUS]    = { 0xcc, 0  },
++	[GK6323_RST_FEMAC_MACIF]  = { 0xd0, 1  },
++};
++
++#define GK_CRG_NR_RESETS	ARRAY_SIZE(gk_crg_resets)
++
++struct gk_crg_priv {
++	struct regmap			*regmap;
++	struct clk_hw_onecell_data	clk_data;
++	struct reset_controller_dev	rcdev;
++};
++
++static inline struct gk_crg_priv *rcdev_to_priv(struct reset_controller_dev *rcdev)
++{
++	return container_of(rcdev, struct gk_crg_priv, rcdev);
++}
++
++static int gk_crg_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
++{
++	struct gk_crg_priv *priv = rcdev_to_priv(rcdev);
++	const struct gk_reset_desc *rst;
++
++	if (id >= GK_CRG_NR_RESETS)
++		return -EINVAL;
++	rst = &gk_crg_resets[id];
++	return regmap_set_bits(priv->regmap, rst->reg_offset, BIT(rst->reset_bit));
++}
++
++static int gk_crg_reset_deassert(struct reset_controller_dev *rcdev, unsigned long id)
++{
++	struct gk_crg_priv *priv = rcdev_to_priv(rcdev);
++	const struct gk_reset_desc *rst;
++
++	if (id >= GK_CRG_NR_RESETS)
++		return -EINVAL;
++	rst = &gk_crg_resets[id];
++	return regmap_clear_bits(priv->regmap, rst->reg_offset, BIT(rst->reset_bit));
++}
++
++static int gk_crg_reset_status(struct reset_controller_dev *rcdev, unsigned long id)
++{
++	struct gk_crg_priv *priv = rcdev_to_priv(rcdev);
++	const struct gk_reset_desc *rst;
++	u32 val;
++
++	if (id >= GK_CRG_NR_RESETS)
++		return -EINVAL;
++	rst = &gk_crg_resets[id];
++	regmap_read(priv->regmap, rst->reg_offset, &val);
++	return !!(val & BIT(rst->reset_bit));
++}
++
++static const struct reset_control_ops gk_crg_reset_ops = {
++	.assert		= gk_crg_reset_assert,
++	.deassert	= gk_crg_reset_deassert,
++	.status		= gk_crg_reset_status,
++};
++
++static int gk_crg_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct gk_crg_priv *priv;
++	struct regmap *regmap;
++	void __iomem *base;
++	unsigned int i;
++	int ret;
++
++	regmap = syscon_node_to_regmap(np);
++	if (IS_ERR(regmap)) {
++		base = devm_platform_ioremap_resource(pdev, 0);
++		if (IS_ERR(base))
++			return PTR_ERR(base);
++		regmap = devm_regmap_init_mmio(dev, base,
++			&(struct regmap_config){
++				.reg_bits = 32, .val_bits = 32,
++				.reg_stride = 4, .max_register = 0x200,
++				.name = "gk6323-crg",
++			});
++		if (IS_ERR(regmap))
++			return PTR_ERR(regmap);
++	}
++
++	priv = devm_kzalloc(dev, struct_size(priv, clk_data.hws, GK_CRG_NR_CLKS), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++	priv->regmap = regmap;
++
++	for (i = 0; i < GK_CRG_NR_CLKS; i++) {
++		const struct gk_gate_clock *gc = &gk_crg_clks[i];
++		struct clk_hw *hw;
++
++		hw = devm_clk_hw_register_gate(dev, gc->name, gc->parent_name, gc->flags,
++					       regmap, gc->reg_offset, gc->gate_bit,
++					       0, NULL);
++		if (IS_ERR(hw)) {
++			dev_err(dev, "failed to register clock %s: %ld\n",
++				gc->name, PTR_ERR(hw));
++			return PTR_ERR(hw);
++		}
++		priv->clk_data.hws[i] = hw;
++	}
++	priv->clk_data.num = GK_CRG_NR_CLKS;
++
++	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, &priv->clk_data);
++	if (ret) {
++		dev_err(dev, "failed to add clock provider: %d\n", ret);
++		return ret;
++	}
++
++	priv->rcdev.ops = &gk_crg_reset_ops;
++	priv->rcdev.owner = THIS_MODULE;
++	priv->rcdev.nr_resets = GK_CRG_NR_RESETS;
++	priv->rcdev.of_node = np;
++
++	ret = devm_reset_controller_register(dev, &priv->rcdev);
++	if (ret) {
++		dev_err(dev, "failed to register reset controller: %d\n", ret);
++		return ret;
++	}
++
++	dev_info(dev, "GK6323V100C CRG: registered %u gate clocks, %u resets\n",
++		 GK_CRG_NR_CLKS, GK_CRG_NR_RESETS);
++	return 0;
++}
++
++static const struct of_device_id gk_crg_of_match[] = {
++	{ .compatible = "goke,gk6323v100c-crg" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, gk_crg_of_match);
++
++static struct platform_driver gk_crg_driver = {
++	.probe = gk_crg_probe,
++	.driver = {
++		.name = "gk6323v100c-crg",
++		.of_match_table = gk_crg_of_match,
++	},
++};
++
++static int __init gk_crg_init(void)
++{
++	return platform_driver_register(&gk_crg_driver);
++}
++arch_initcall_sync(gk_crg_init);
++
++static void __exit gk_crg_exit(void)
++{
++	platform_driver_unregister(&gk_crg_driver);
++}
++module_exit(gk_crg_exit);
++
++MODULE_DESCRIPTION("GK6323V100C minimal CRG clock/reset driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/include/dt-bindings/clock/gk6323v100c-crg.h b/include/dt-bindings/clock/gk6323v100c-crg.h
+new file mode 100644
+index 000000000000..bbbbbbbbbb
+--- /dev/null
++++ b/include/dt-bindings/clock/gk6323v100c-crg.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __DT_BINDINGS_CLOCK_GK6323V100C_CRG_H
++#define __DT_BINDINGS_CLOCK_GK6323V100C_CRG_H
++
++#define GK6323_CLK_MCI_BUS		0
++#define GK6323_CLK_MCI_CIU		1
++
++#define GK6323_CLK_USB2_BUS		2
++#define GK6323_CLK_USB2_OHCI		3
++#define GK6323_CLK_USB2_HSTPHY		4
++#define GK6323_CLK_USB2_UTMI0		5
++#define GK6323_CLK_USB2_PHY_REF		6
++
++#define GK6323_CLK_FEMAC_BUS		7
++#define GK6323_CLK_FEMAC_IF		8
++
++#define GK6323_CLK_CRGC_NR		9
++
++#endif
+diff --git a/include/dt-bindings/reset/gk6323v100c-resets.h b/include/dt-bindings/reset/gk6323v100c-resets.h
+new file mode 100644
+index 00000000000..bbbbbbbbbb
+--- /dev/null
++++ b/include/dt-bindings/reset/gk6323v100c-resets.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __DT_BINDINGS_RESET_GK6323V100C_RESETS_H
++#define __DT_BINDINGS_RESET_GK6323V100C_RESETS_H
++
++#define GK6323_RST_MCI0			0
++
++#define GK6323_RST_USB2_HST		1
++#define GK6323_RST_USB2_UTMI0		2
++#define GK6323_RST_USB2_PHY		3
++#define GK6323_RST_USB2_PORT0		4
++
++#define GK6323_RST_FEMAC_BUS		5
++#define GK6323_RST_FEMAC_MACIF		6
++
++#define GK6323_RST_CRGC_NR		7
++
++#endif
+--
+2.43.0

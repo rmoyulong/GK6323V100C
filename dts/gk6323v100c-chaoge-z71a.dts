@@ -1,34 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * 国科微 GK6323V100C（整机型号 ChaoGe Z71A）板级设备树 —— 引导最小集
+ * 国科微 GK6323V100C（整机型号 ChaoGe Z71A）板级设备树 —— CRG 接入版
  *
- * 数据来源：真机原厂内核导出的 /sys/firmware/devicetree/base，逐项对齐，
- * 没有臆造参数。真机实测为 4×Cortex-A55（part 0xd05）+ GICv3 + 国科私有 CRU，
- * 不是海思的 A53 + GIC-400，所以本文件不是海思 mv200h 板级的照抄。
+ * 基于「引导最小集」加入最小 CRG 驱动的时钟/复位：
+ *   - CRU/CRG 节点 compatible 切换为 "goke,gk6323v100c-crg"，
+ *     由本补丁新增的最小驱动 crg-gk6323v100c.c 在 arch_initcall_sync 阶段
+ *     probe（控制台已建好，出错可见 dmesg，不会花屏锁死）。
+ *   - eMMC、FEMAC(+MDIO)、EHCI、OHCI 四个节点接入 CRG 的门控时钟与复位，
+ *     时钟 ID / 复位 ID 数字直接写出，避免 dtc 预处理。
+ *   - 加回 vdp@7f000000 保留区（U-Boot 帧缓冲在 0x7f511000，被内核当
+ *     普通内存覆盖会花屏）。
+ *   - 加 USB2 PHY 占位节点（phys 属性先不接，PHY 驱动要单独写，本轮先
+ *     让 EHCI/OHCI 的时钟和复位通）。
  *
- * 为什么只有这些节点 —— 引导器读了 16KiB 就收手：
- *   U-Boot 的 bootcmd 是
- *     mmc read 0 0x03FFC000 0x19000 0x20
- *   即从 dtbo 分区（起始块 0x19000）只读 0x20 = 32 块 = 16KiB 到 0x03FFC000，
- *   这个地址紧贴内核加载地址 0x04000000 之下。设备树超过 16KiB 就会被截断，
- *   内核解析失败 → 起不来。作者那版 dtbo 里的 dtb 只有 9156 字节。
- *   所以本文件只保留「点亮系统所必需」的节点，其余一律不写：
- *     串口控制台(uart0) / eMMC / 复位看门狗 / USB 主控 / 网口 / RTC
- *
- * 本次相对上一版删掉的（引导用不到，需要时再加回来）：
- *   GPIO×8（PL061，无任何消费者）、uart2、uart3、i2c0、i2c1、spi0、
- *   chosen 下的 simple-framebuffer、vdp 保留内存，
- *   aliases 中除 serial0 以外的全部别名，以及根 compatible 的第三串。
- *
- * 与真机原树的有意差异（让主线内核能认领硬件）：
- *   1) eMMC 的 compatible 追加 "snps,dw-mshc"，使主线 dw_mmc-pltfm 能够认领
- *      （原 compatible 是国科 BSP 私有名，主线无此驱动）；
- *   2) 各外设时钟改指下面的 fixed-clock，不再引用国科私有 CRU —— 主线没有
- *      该 CRU 驱动，继续引用会让外设 probe 时永久 -EPROBE_DEFER；
- *   3) 真机树里主线无驱动的节点（aiao 音频、cpufreq、thermal、ir、cru）不写。
- *
- * 中断 specifier：GICv3 为 3 个 cell = <类型 号 触发方式>，类型 0=SPI、1=PPI，
- * 号是 GIC 视角的号（SPI 号 = 真机 /proc/interrupts 里的号 - 32）。
+ * 其他结构（内存 / GIC / PSCI / uart / i2c2 / rtc / watchdog / ranges）
+ * 完全保持与可启动版本一致，不做任何重构。
  */
 
 /dts-v1/;
@@ -40,33 +26,20 @@
 	#size-cells = <2>;
 	interrupt-parent = <&gic>;
 
-	/* stdout-path = "serial0:..." 依赖这条别名，其余别名引导用不到 */
 	aliases {
 		serial0 = &uart0;
 	};
 
 	chosen {
-		/* 与 bootargs 分区一致；root= 亦由此下发 */
 		bootargs = "earlycon=pl011,mmio32,0xf8b00000,115200n8 console=ttyAMA0,115200n8 console=tty0 clk_ignore_unused net.ifnames=0 root=/dev/mmcblk0p18 rootfstype=ext4 rootwait rw panic=-1 blkdevparts=mmcblk0:1M(fastboot),512K(bootargs),512K(bootargsbak),20M(recovery),2M(deviceinfo),8M(securestore),2M(atf),8M(baseparam),8M(pqparam),2M(dtbo),10M(logo),10M(logobak),20M(fastplay),20M(recoverybak),60M(boot),20M(misc),20M(trustedcore),-(rootfs)";
 		stdout-path = "serial0:115200n8";
 	};
 
-	/*
-	 * 内存：2GiB，取自**真机导出的设备树**（hwinfo/hw1.txt 里的
-	 *   memory@0 { reg = <0x00 0x00 0x00 0x80000000>; }）
-	 * 与真机 /proc/meminfo 的 MemTotal: 2018984 kB，两者吻合。
-	 * ★ 不要被 U-Boot 那两行 "DRAM: 1 GiB" / "DDR Size: 1 GiB (Boot: 1 GiB)"
-	 *   误导：那是 U-Boot 自己的可映射上限（它启动内核只需 1GiB 就够），
-	 *   不代表硬件容量。写成 1GiB 会让内核白白少认一半内存。
-	 * 作者那版的 vdp@7f000000(2032MB) 与 framebuffer@7f511000 都在 2GiB 内，
-	 * 但本机第一阶段不用显示与硬解，故不写。
-	 */
 	memory@0 {
 		device_type = "memory";
 		reg = <0x00 0x00 0x00 0x80000000>;
 	};
 
-	/* BL31(ATF) 与 OPTEE 占用区，必须告知内核，否则会被当作可用内存 */
 	reserved-memory {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -81,9 +54,20 @@
 			reg = <0x00 0xd200000 0x00 0x400000>;
 			no-map;
 		};
+
+		/*
+		 * VDP/framebuffer 保留区（16MB）：
+		 * U-Boot 在 0x7f511000 放了开机 logo 的帧缓冲，若内核把
+		 * 这块当普通内存分配，会立刻盖掉画面造成花屏/黑屏。
+		 * 与原厂设备树 vdp@7f000000 对齐。
+		 */
+		vdp@7f000000 {
+			reg = <0x00 0x7f000000 0x00 0x01000000>;
+			no-map;
+		};
 	};
 
-	/* 国科 CRU 无主线驱动，外设时钟一律用固定时钟，由 bootloader 保持上电 */
+	/* 固定时钟：给 uart/i2c/看门狗/CRG 父时钟用 */
 	clocks {
 		clk_24m: clk-24m {
 			compatible = "fixed-clock";
@@ -142,7 +126,6 @@
 		method = "smc";
 	};
 
-	/* A55 的 arch timer：4 个 PPI，频率 24MHz（与真机一致） */
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupts = <1 13 4>, <1 14 4>, <1 11 4>, <1 10 4>;
@@ -163,7 +146,37 @@
 		compatible = "simple-bus";
 		ranges = <0xf0000000 0x0 0xf0000000 0x10000000>;
 
-		/* 控制台串口：bootargs 的 console=ttyAMA0 指这里 */
+		/*
+		 * CRU/CRG 时钟复位控制器（最小驱动版）
+		 *
+		 * 基址 f8a22000 来源：
+		 *   - 原厂 TTL 第 207 行：gk6323v100c-cru f8a22000.clock
+		 *   - 原厂反编译 dts：clock@f8a22000
+		 *   - Hi3798MV310 BSP: hivendor_clock 基址 f8a22000
+		 *
+		 * compatible = "goke,gk6323v100c-crg" 由本补丁
+		 * crg-gk6323v100c.c 绑定。
+		 * 时钟 ID 与复位 ID 全部使用数字，避免 dtc 预处理。
+		 * #clock-cells = <1>, #reset-cells = <1>：
+		 *   - clocks = <&cru CLK_ID>
+		 *   - resets = <&cru RST_ID>
+		 */
+		cru: clock@f8a22000 {
+			compatible = "goke,gk6323v100c-crg", "syscon", "simple-mfd";
+			reg = <0xf8a22000 0x400>;
+			#clock-cells = <1>;
+			#reset-cells = <1>;
+		};
+
+		/* USB2 PHY 占位：后续单独写 inno-usb2-phy 驱动再启用 phys 引用 */
+		usb2_phy: usb-phy@f9865000 {
+			compatible = "hisilicon,hi3798mv200-usb2-phy";
+			reg = <0xf9865000 0x1000>;
+			#phy-cells = <0>;
+			status = "disabled";
+		};
+
+		/* 控制台串口 */
 		uart0: serial@f8b00000 {
 			compatible = "arm,pl011", "arm,primecell";
 			reg = <0xf8b00000 0x1000>;
@@ -172,7 +185,6 @@
 			clock-names = "uartclk", "apb_pclk";
 		};
 
-		/* 板载 RTC：PCF8563 挂在 i2c2 上，地址 0x51 */
 		i2c2: i2c@f8b12000 {
 			compatible = "hisilicon,hix5hd2-i2c";
 			reg = <0xf8b12000 0x1000>;
@@ -190,16 +202,18 @@
 		};
 
 		/*
-		 * eMMC：根文件系统在 mmcblk0p18，本项必须起来。
-		 * 第二段 reg 是国科 CRU 里那 0x40 字节的 SD 时钟控制寄存器，保留原位，
-		 * 主线驱动不会去动它（时钟由 bootloader 保持上电）。
+		 * eMMC：根文件系统在 mmcblk0p18
+		 * clocks: 0=BIU(bus), 1=CIU（即 GK6323_CLK_MCI_BUS/_CIU）
+		 * resets: 0=MCI0（即 GK6323_RST_MCI0）
 		 */
 		emmc: mmc@f9830000 {
 			compatible = "goke,gk6323v100c-dw-mshc", "snps,dw-mshc";
 			reg = <0xf9830000 0x1000>, <0xf8a21000 0x40>;
 			interrupts = <0 35 4>;
-			clocks = <&clk_50m>, <&clk_50m>;
+			clocks = <&cru 0>, <&cru 1>;
 			clock-names = "biu", "ciu";
+			resets = <&cru 0>;
+			reset-names = "reset";
 			fifo-depth = <0x100>;
 			card-detect-delay = <200>;
 			bus-width = <8>;
@@ -208,12 +222,19 @@
 			disable-wp;
 		};
 
-		/* 板载百兆网口：PHY 挂在下面的 mdio 总线上，地址 2 */
+		/*
+		 * 百兆网口
+		 * clocks: 7=BUS, 8=IF（FEMAC_BUS / FEMAC_IF）
+		 * resets: 5=BUS, 6=MACIF（FEMAC_BUS / FEMAC_MACIF）
+		 */
 		femac: ethernet@f9c30000 {
 			compatible = "hisilicon,hisi-femac-v2";
 			reg = <0xf9c30000 0x1000>, <0xf9c31300 0x300>;
 			interrupts = <0 72 4>;
-			clocks = <&clk_75m>;
+			clocks = <&cru 7>, <&cru 8>;
+			clock-names = "hisi_femac_clk", "clk_macif";
+			resets = <&cru 5>, <&cru 6>;
+			reset-names = "mac", "macif";
 			phy-mode = "mii";
 			phy-handle = <&phy2>;
 		};
@@ -221,7 +242,7 @@
 		mdio@f9c31100 {
 			compatible = "hisilicon,hisi-femac-mdio";
 			reg = <0xf9c31100 0x100>;
-			clocks = <&clk_75m>;
+			clocks = <&cru 7>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 
@@ -230,20 +251,35 @@
 			};
 		};
 
-		/* USB2.0：真机只有 EHCI/OHCI，无 xhci */
+		/*
+		 * USB2.0
+		 * clocks: 2=BUS, 3=OHCI_48M, 4=HSTPHY, 5=UTMI0, 6=PHY_REF
+		 * resets:
+		 *   - EHCI: 1=HST, 2=UTMI0, 4=PORT0
+		 *   - OHCI: 1=HST, 4=PORT0（OHCI 与 EHCI 共用 HST/端口复位）
+		 * 复位顺序（驱动会处理 deassert）：HST→UTMI0→PHY_REF→PORT0
+		 */
 		ohci: usb@f9880000 {
 			compatible = "generic-ohci";
 			reg = <0xf9880000 0x10000>;
 			interrupts = <0 67 4>;
+			clocks = <&cru 2>, <&cru 3>;
+			clock-names = "usb_host", "usb_ohci";
+			resets = <&cru 1>, <&cru 4>;
+			reset-names = "soft", "port";
 		};
 
 		ehci: usb@f9890000 {
 			compatible = "generic-ehci";
 			reg = <0xf9890000 0x10000>;
 			interrupts = <0 66 4>;
+			clocks = <&cru 2>, <&cru 4>, <&cru 5>, <&cru 6>;
+			clock-names = "usb_host", "usb_hstphy", "usb_utmi0", "usb_phy_ref";
+			resets = <&cru 1>, <&cru 2>, <&cru 4>;
+			reset-names = "soft", "utmi0", "port";
 		};
 
-		/* SP805 看门狗：也是 panic 后重启的复位通道 */
+		/* SP805 看门狗 */
 		watchdog@f8a2c000 {
 			compatible = "arm,sp805-wdt", "arm,primecell";
 			reg = <0xf8a2c000 0x1000>;

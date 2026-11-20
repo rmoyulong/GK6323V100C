@@ -107,11 +107,13 @@ jobs:
       - name: 校验必要文件存在
         run: |
           set -euo pipefail
-          for f in apply_histb_patches.sh "$FRAGMENT" slim.config "$BOARD_DTS" dts/check-dts.py; do
+          for f in apply_histb_patches.sh "$FRAGMENT" slim.config "$BOARD_DTS" dts/check-dts.py patches/900-01-clk-add-gk6323v100c-crg-driver.patch; do
             [ -f "$f" ] || { echo "::error::根目录缺少 $f"; exit 1; }
           done
+          [ -d patches ] || { echo "::error::根目录缺少 patches/ 目录"; exit 1; }
           chmod +x apply_histb_patches.sh
           ls -lh apply_histb_patches.sh "$FRAGMENT" slim.config "$BOARD_DTS" dts/check-dts.py
+          ls -lh patches/ 2>/dev/null || echo "（仓库根目录无 patches/，首次运行时请新建）"
 
       - name: 工作流静态自检（防 set -e + pipefail 下的裸管道赋值）
         run: |
@@ -216,6 +218,17 @@ jobs:
           fi
           echo "版本校验通过：$ACT"
 
+      - name: 注入 GK6323 CRG 最小驱动补丁（900-01）
+        run: |
+          set -euo pipefail
+          # 把本仓库 patches/ 下的 9xx 高序号补丁拷到 histb-patches，
+          # apply_histb_patches.sh 会按文件名序号应用；900 系列在所有海思补丁之后，
+          # 这样对 drivers/clk/hisilicon/{Kconfig,Makefile} 的追加不会被后续补丁覆盖。
+          cp -v patches/900-*.patch histb-patches/
+          ls histb-patches/900-*.patch
+          echo "--- 900 补丁文件大小 ---"
+          wc -l histb-patches/900-*.patch
+
       - name: 应用 histb 补丁（调用仓库根目录 apply_histb_patches.sh）
         run: |
           set -euo pipefail
@@ -225,6 +238,45 @@ jobs:
           PATCHES_DIR="../histb-patches" CI=true bash ../apply_histb_patches.sh -y
           echo "=== 补丁后确认 ===（本仓库设备树自带，不再要求补丁库含 mv200h 板级 dts）"
           ls arch/arm64/boot/dts/hisilicon/ | head -20 || true
+
+      - name: 追加 GK6323 CRG 驱动到 Kconfig / Makefile（幂等）
+        run: |
+          set -euo pipefail
+          cd linux_build
+          KC=drivers/clk/hisilicon/Kconfig
+          MK=drivers/clk/hisilicon/Makefile
+          [ -f "$KC" ] || { echo "::error::$KC 不存在"; exit 1; }
+          [ -f "$MK" ] || { echo "::error::$MK 不存在"; exit 1; }
+
+          if grep -q "^config COMMON_CLK_GK6323V100C$" "$KC"; then
+            echo "OK Kconfig 已存在 COMMON_CLK_GK6323V100C，跳过"
+          else
+            {
+              echo ""
+              echo "config COMMON_CLK_GK6323V100C"
+              echo "\ttristate \"Clock driver for GK6323V100C CRG\""
+              echo "\tdepends on ARCH_HISI || COMPILE_TEST"
+              echo "\tdepends on HAS_IOMEM"
+              echo "\tdepends on RESET_CONTROLLER"
+              echo "\tdefault ARCH_HI3798MV200"
+              echo "\thelp"
+              echo "\t  Minimal clock and reset driver for GK6323V100C CRG."
+              echo "\t  Registers gate clocks and resets for eMMC/USB2/FEMAC;"
+              echo "\t  other PLLs/peripherals are left to U-Boot."
+            } >> "$KC"
+            echo "OK 已向 Kconfig 追加 COMMON_CLK_GK6323V100C"
+          fi
+
+          if grep -q "crg-gk6323v100c" "$MK"; then
+            echo "OK Makefile 已存在 crg-gk6323v100c，跳过"
+          else
+            echo "obj-\$(CONFIG_COMMON_CLK_GK6323V100C)\t+= crg-gk6323v100c.o" >> "$MK"
+            echo "OK 已向 Makefile 追加 crg-gk6323v100c.o"
+          fi
+
+          tail -12 "$KC"
+          echo "---"
+          tail -5 "$MK"
 
       - name: 应用 GK6323 DTB 兜底启动补丁（照搬 Hi3798MV320 逻辑）
         run: |
@@ -364,6 +416,7 @@ jobs:
           #   「必须项」校验挡下（日志停在 CONFIG_CLK_GK6323V100C 未开启）。
           scripts/config --enable COMMON_CLK
           scripts/config --enable COMMON_CLK_HI3798MV200
+          scripts/config --enable COMMON_CLK_GK6323V100C
           scripts/config --enable RESET_CONTROLLER
           scripts/config --enable RESET_HISI
           # 中断控制器 / 定时器（真机是 GICv3 + A55，不是 GIC-400 + A53）
@@ -521,7 +574,7 @@ jobs:
           echo "=== 期望项：没生效只告警（可能依赖未满足或被改名）==="
           for s in OF SERIAL_AMBA_PL011 \
                    MMC MMC_DW MMC_DW_PLTFM MMC_DW_HI3798CV200 \
-                   COMMON_CLK_HI3798MV200 \
+                   COMMON_CLK_HI3798MV200 COMMON_CLK_GK6323V100C \
                    OF_MDIO MDIO_HISI_FEMAC \
                    GENERIC_PHY USB_PHY \
                    USB_EHCI_HCD_PLATFORM USB_OHCI_HCD USB_OHCI_HCD_PLATFORM USB_STORAGE \
@@ -696,7 +749,7 @@ jobs:
           echo "=== 反编译回读关键项，确认编译结果与真机一致 ==="
           "$DTC" -I dtb -O dts "$OUT" > /tmp/rt.dts
           for k in "arm,cortex-a55" "arm,gic-v3" "arm,pl011" "goke,gk6323v100c" \
-                   "goke,gk6323v100c-dw-mshc" "snps,dw-mshc" \
+                   "goke,gk6323v100c-crg" "goke,gk6323v100c-dw-mshc" "snps,dw-mshc" \
                    "hisilicon,hisi-femac-v2" "hisilicon,hisi-femac-mdio" \
                    "generic-ehci" "generic-ohci" \
                    "nxp,pcf8563" "arm,sp805-wdt"; do
