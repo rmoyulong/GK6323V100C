@@ -9,7 +9,7 @@ name: GK6323V100C 主线内核自动构建
 # 与 hisi.yml 的差别只有 5 处，其余照搬：
 #   1) ARCH=arm64，交叉工具链 aarch64-linux-gnu-
 #   2) 内核是 arch/arm64/boot/Image，uImage 用 -A arm64 打包
-#   3) 设备树用它自己那份（dts/gk6323v100c-chaoge-z71a.dts，逐项取自
+#   3) 设备树用它自己那份（dts/gk6323v100c-cru-fixed.dts，逐项取自
 #      真机），追加到内核镜像末尾，追加处校验魔数 d00dfeed；同时把
 #      该 dtb 单独放进 Release，必须写入 dtbo 分区（/dev/mmcblk0p10）
 #   4) 单板配置多一项 CONFIG_SND_USB_AUDIO=m —— 本仓库存在的理由
@@ -23,7 +23,7 @@ name: GK6323V100C 主线内核自动构建
 #
 # 三点必须知道的事（详见 README）：
 #   a) 这台不是海思 MV200H。真机实测为 4×Cortex-A55 + GICv3 +
-#      国科私有 CRU，所以设备树用仓库自带的 gk6323v100c-chaoge-z71a.dts，
+#      国科私有 CRU，所以设备树用仓库自带的 gk6323v100c-cru-fixed.dts，
 #      **不再**用补丁库里海思 A53 的 mv200h 板级 dts（用错会红灯循环重启）。
 #   b) 本基线是主线内核，不是作者那版国科 BSP 内核（6.18.46-gk6323-debian）。
 #      产出内核版本号因此是 7.4.x，模块装到 /lib/modules/7.4.x 下 ——
@@ -76,7 +76,7 @@ jobs:
       UIMAGE_LOADADDR: "0x02000000"
       UIMAGE_ENTRYADDR: "0x02000000"
       # 本仓库自带的板级设备树（逐项取自真机，不再用补丁库的 mv200h 板级）
-      BOARD_DTS: dts/gk6323v100c-chaoge-z71a.dts
+      BOARD_DTS: dts/gk6323v100c-cru-fixed.dts
       TARGET_DTB: gk6323v100c-chaoge-z71a.dtb
       # 单板配置层
       FRAGMENT: kernel.config
@@ -1117,7 +1117,7 @@ jobs:
           # 编出来约 3800 字节，只占窗口 23%，余量充足。故这里可以直接判死。
           if [ "$DTBSIZE" -gt 16384 ]; then
             echo "::error::设备树 $DTBSIZE 字节 > 16KiB 读取窗口 —— 刷上去会被截断，内核起不来。"
-            echo "::error::处理：精简 dts/gk6323v100c-chaoge-z71a.dts 的节点（先删无消费者的 gpio、未用的 uart2/3、i2c0/1、spi0），"
+            echo "::error::处理：精简 dts/gk6323v100c-cru-fixed.dts 的节点（先删无消费者的 gpio、未用的 uart2/3、i2c0/1、spi0），"
             echo "::error::或确认没有给 dtc 加回 -@（-@ 会白白生成 __symbols__ 节点，多占约 900 字节）。"
             exit 1
           fi
