@@ -666,7 +666,8 @@ jobs:
           #   RESET_GK6323，这三个符号在本内核树里根本不存在 —— 构建会被自己的
           #   「必须项」校验挡下（日志停在 CONFIG_CLK_GK6323V100C 未开启）。
           scripts/config --enable COMMON_CLK
-          scripts/config --enable COMMON_CLK_HI3798MV200
+          #使用自己的补丁CLK_GK6323V100C
+          #scripts/config --enable COMMON_CLK_HI3798MV200
           scripts/config --enable COMMON_CLK_GK6323V100C
           scripts/config --enable RESET_CONTROLLER
           scripts/config --enable RESET_HISI
