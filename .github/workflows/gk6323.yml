@@ -52,6 +52,7 @@ on:
       - 'slim.config'
       - 'apply_histb_patches.sh'
       - 'dts/*.dts'
+      - 'patches/*.patch'
       - 'dts/check-dts.py'
   workflow_dispatch:
 
