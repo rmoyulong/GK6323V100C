@@ -263,15 +263,15 @@ jobs:
             // SPDX-License-Identifier: GPL-2.0
             /*
              * Goke GK6323V100C CRG Clock and Reset Driver
-             * Early init (CLK_OF_DECLARE_DRIVER): enables peripheral clock gates BEFORE
-             * any peripheral driver probes, but NEVER does bulk reset (U-Boot already
-             * initialized eMMC/USB/PHY at boot time, resetting them in Linux breaks boot).
+             * Early init: enables peripheral clock gates before peripheral drivers probe,
+             * NO bulk reset (U-Boot already initialized eMMC/USB/PHY)
              */
             #include <linux/init.h>
             #include <linux/module.h>
             #include <linux/io.h>
             #include <linux/of.h>
             #include <linux/of_address.h>
+            #include <linux/clk-provider.h>
             #include <linux/reset-controller.h>
             #include <linux/bitops.h>
             #include <linux/delay.h>
@@ -286,7 +286,7 @@ jobs:
             static DEFINE_SPINLOCK(gk_crg_lock);
             static struct gk_crg_priv *gk_crg_global;
 
-            /* 时钟门控表：只开时钟，不碰复位 */
+            /* Clock gates: only enable, never touch reset bits */
             static const struct { u32 off; u8 bit; const char *name; } gk_gates[] = {
                 {0xa0, 0, "emmc-bus",    },
                 {0xa0, 1, "emmc-ciu",    },
@@ -306,7 +306,7 @@ jobs:
                 {0x118,1, "aiao-mod",    },
             };
 
-            /* 复位表：仅提供给外设驱动单独调用，我们绝不主动复位 */
+            /* Reset lines: registered for per-driver use, we never trigger bulk reset */
             static const struct { u32 off; u8 bit; } gk_resets[] = {
                 {0xa0, 0}, {0xa0, 1},
                 {0xb8, 0}, {0xb8, 1}, {0xb8, 2}, {0xb8, 3}, {0xb8, 6},
@@ -380,16 +380,16 @@ jobs:
                 priv->base = base;
                 gk_crg_global = priv;
 
-                /* 【唯一动作】只开所有外设时钟门，绝对不碰复位，不破坏U-Boot状态 */
+                /* Only enable clock gates, DO NOT reset anything - preserve U-Boot state */
                 for (i = 0; i < ARRAY_SIZE(gk_gates); i++) {
                     val = readl_relaxed(base + gk_gates[i].off);
                     val |= BIT(gk_gates[i].bit);
                     writel_relaxed(val, base + gk_gates[i].off);
                 }
 
-                /* 注册复位控制器，供外设驱动自己调用复位，我们不主动触发 */
+                /* Register reset controller for per-driver use */
                 priv->rcdev.ops = &gk_crg_reset_ops;
-                priv->rcdev.owner = THIS_MODULE;
+                priv->rcdev.owner = NULL;
                 priv->rcdev.of_node = np;
                 priv->rcdev.nr_resets = ARRAY_SIZE(gk_resets);
                 priv->rcdev.of_reset_n_cells = 2;
@@ -400,11 +400,14 @@ jobs:
                 pr_info("GK6323V100C CRG: %zu clock gates enabled (no bulk reset, U-Boot state preserved)\n",
                         ARRAY_SIZE(gk_gates));
             }
-            CLK_OF_DECLARE_DRIVER(gk6323v100c_crg, "goke,gk6323v100c-cru", gk_crg_early_init);
-            CLK_OF_DECLARE_DRIVER(gk6323v100c_crg_alias, "goke,gk6323v100c-crg", gk_crg_early_init);
+
+            /* Support both compatible strings to match DTS variants */
+            CLK_OF_DECLARE_DRIVER(gk6323v100c_cru, "goke,gk6323v100c-cru", gk_crg_early_init);
+            CLK_OF_DECLARE_DRIVER(gk6323v100c_crg, "goke,gk6323v100c-crg", gk_crg_early_init);
 
             MODULE_DESCRIPTION("Goke GK6323V100C CRG clock gate driver");
             MODULE_LICENSE("GPL");
+
             CEOF
 
             # ★ 本步骤只负责把两个源文件放进内核树；Kconfig / Makefile 的登记
