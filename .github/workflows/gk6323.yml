@@ -259,8 +259,8 @@ jobs:
             #endif
             CEOF
 
-                      # 写入驱动文件 crg-gk6323v100c.c
-                      cat > crg-gk6323v100c.c << 'CEOF'
+            # 写入驱动文件 crg-gk6323v100c.c
+            cat > crg-gk6323v100c.c << 'CEOF'
             // SPDX-License-Identifier: GPL-2.0
             /*
              * Goke GK6323V100C CRG Clock and Reset Driver
@@ -459,8 +459,8 @@ jobs:
             MODULE_LICENSE("GPL");
             CEOF
 
-                      # 追加Kconfig配置
-                      cat >> Kconfig << 'EOF'
+            # 追加Kconfig配置
+            cat >> Kconfig << 'EOF'
             config COMMON_CLK_GK6323V100C
                 bool "Goke GK6323V100C CRG clock and reset driver"
                 depends on ARCH_HISTB || COMPILE_TEST
