@@ -777,7 +777,6 @@ jobs:
           # 强制禁用无关的Hi3798MV200 CRG驱动（依赖缺失PLL补丁会编译失败，我们不需要它）
           sed -i 's/^CONFIG_COMMON_CLK_HI3798MV200=.*$/# CONFIG_COMMON_CLK_HI3798MV200 is not set/' .config
           # 强制确保我们自己的GK6323 CRG驱动开启
-          echo "# CONFIG_COMMON_CLK_HI3798MV200 is not set" >> .config
           echo "CONFIG_COMMON_CLK_GK6323V100C=y" >> .config
           
 
