@@ -1,20 +1,20 @@
-From 6a02b2c6568902882c4350909f5fb4c90f87b1a4 Mon Sep 17 00:00:00 2001
+From 18c266e7073dd203e24c54c6943d320451d19bca Mon Sep 17 00:00:00 2001
 From: build <b@local>
-Date: Sat, 21 Nov 2026 02:04:47 +0800
+Date: Sat, 21 Nov 2026 12:37:48 +0800
 Subject: [PATCH] clk: hisilicon: add the GK6323V100C CRG gate/reset preset
  driver
 
 ---
- drivers/clk/hisilicon/crg-gk6323v100c.c | 279 ++++++++++++++++++++++++
- 1 file changed, 279 insertions(+)
+ drivers/clk/hisilicon/crg-gk6323v100c.c | 291 ++++++++++++++++++++++++
+ 1 file changed, 291 insertions(+)
  create mode 100644 drivers/clk/hisilicon/crg-gk6323v100c.c
 
 diff --git a/drivers/clk/hisilicon/crg-gk6323v100c.c b/drivers/clk/hisilicon/crg-gk6323v100c.c
 new file mode 100644
-index 0000000..1ff83d6
+index 0000000..d0a894f
 --- /dev/null
 +++ b/drivers/clk/hisilicon/crg-gk6323v100c.c
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,291 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * GK6323V100C（国科微）CRG 门控/复位预置驱动
@@ -46,13 +46,14 @@ index 0000000..1ff83d6
 + *       eMMC   0xa0 bit0=biu / bit1=ciu
 + *       USB2   0xb8 bit0=bus / bit1=48M / bit2=12M / bit4=hst_phy
 + *              bit5=utmi0 / bit6=utmi1；0xbc bit0=PHY1 参考时钟
-+ *       FEMAC  0xd0 bit0=bus / bit1=mac；0x388 bit0=fephy
++ *       FEMAC  0xcc bit0=bus / bit1=mac；0x388 bit0=fephy
 + *     该表还特意注明：CRG51/CRG52 的「时钟使能位」与「软复位请求位」
 + *     是成对分开的两组位（例如 CRG51 使能在 bit1/bit3，复位请求在
 + *     bit0/bit2），所以使能与复位绝不能写成同一个位。
 + *   - 复位位取自补丁库 815-02（Hi3798MV200 SoC dtsi）各节点 resets 单元：
 + *       eMMC <0xa0 4>；EHCI <0xb8 12/13/14/16>；OHCI <0xb8 12>
 + *       USB2 PHY <0xbc 4>；端口 0/1 <0xbc 8/9>；FEMAC mac <0xd0 3>
++ *       FEMAC phy（FEPHY 自身复位）<0x388 4>
 + *   - 基址 f8a22000：真机原厂 TTL 打印 "gk6323v100c-cru f8a22000.clock"，
 + *     与反编译出的原厂设备树 clock@f8a22000 完全一致。
 + *
@@ -110,9 +111,11 @@ index 0000000..1ff83d6
 +	 */
 +	{ 0xbc, 0 },	/* clk_u2_phy1_ref */
 +
-+	/* FEMAC：PERI_CRG51/52 @ 0xd0，内部 PHY 的 FEPHY 门在 0x388 */
-+	{ 0xd0, 0 },	/* clk_femacif（bus） */
-+	{ 0xd0, 1 },	/* clk_femac */
++	/* FEMAC：PERI_CRG51 @ 0xcc（时钟门）、PERI_CRG52 @ 0xd0（软复位）
++	 * 内部 PHY 的 FEPHY 时钟门在 0x388
++	 */
++	{ 0xcc, 0 },	/* clk_femacif（bus） */
++	{ 0xcc, 1 },	/* clk_femac */
 +	{ 0x388, 0 },	/* clk_fephy */
 +
 +	/* AIAO：PERI_CRG70 @ 0x118，bit0 工作时钟、bit4 软复位 */
@@ -131,6 +134,17 @@ index 0000000..1ff83d6
 +	{ 0xbc, 9 },	/* USB2 端口 1 */
 +	{ 0xd0, 3 },	/* FEMAC mac 软复位 */
 +	{ 0x118, 4 },	/* AIAO 软复位 */
++	/*
++	 * FEPHY：0x388 bit0 是 PHY 参考时钟门（已在上表写开），bit4 是 PHY
++	 * 自身的复位。真机实测：
++	 *   bit4 = 1（复位断言）→ 网口灯不亮，PHY ID 读成 0x00000000；
++	 *   bit4 = 0（复位释放）→ 灯亮，link 100M。
++	 * 这里在 probe（arch_initcall_sync，约 0.06s）时就把它释放并保持，
++	 * 比 hisi_femac 自己 probe（约 0.9s）早约 800ms，给 PHY 留足内部
++	 * 初始化时间。设备树里因此不再声明 "phy" 复位，避免驱动在读 ID 前
++	 * 才做「断言→释放」，也避免 bit4 一直停在断言态把 PHY 按住。
++	 */
++	{ 0x388, 4 },	/* FEPHY PHY 复位：释放并保持 */
 +};
 +
 +struct gk_crg_priv {
