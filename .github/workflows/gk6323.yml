@@ -482,6 +482,7 @@ jobs:
           # 该脚本自判：有 series 按 series，没有则按文件名序号应用全部 *.patch；
           # 等价于 quilt --fuzz=0，遇冲突即中止并回滚，不会静默产出缺补丁的内核
           #PATCHES_DIR="../histb-patches" CI=true bash ../apply_histb_patches.sh -y
+          #我们自己的CRG驱动独立工作，不依赖任何海思原厂PLL补丁
           PATCHES_DIR="../histb-patches" CI=true SKIP_ON_CONFLICT=1 bash ../apply_histb_patches.sh -y
           echo "=== 补丁后确认 ===（本仓库设备树自带，不再要求补丁库含 mv200h 板级 dts）"
           ls arch/arm64/boot/dts/hisilicon/ | head -20 || true
