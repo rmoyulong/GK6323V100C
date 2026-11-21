@@ -288,18 +288,28 @@ jobs:
 
             /* Clock gates: only enable, never touch reset bits */
             static const struct { u32 off; u8 bit; const char *name; } gk_gates[] = {
-                {0xa0, 0, "emmc-bus",    },  /* eMMC AHB总线时钟（已验证正确） */
-                {0xa0, 1, "emmc-ciu",    },  /* eMMC CIU工作时钟（已验证正确） */
-                /* 🔴 删掉所有0xb8/0xb USB相关位，不碰USB寄存器，保留U-Boot配置让USB正常工作 */
+                {0xa0, 0, "emmc-bus",    },  /* eMMC AHB总线时钟（已验证正常） */
+                {0xa0, 1, "emmc-ciu",    },  /* eMMC CIU工作时钟（已验证正常） */
+                /* 🔴 加回USB时钟门（只开时钟，不碰复位！） */
+                {0xb8, 0, "usb2-ctrl0",  },  /* USB2控制器0时钟 */
+                {0xb8, 1, "usb2-ctrl1",  },  /* USB2控制器1时钟 */
+                {0xb8, 2, "usb2-ctrl2",  },  /* USB2控制器2时钟 */
+                {0xb8, 3, "usb2-bus",    },  /* USB2 AHB总线时钟 */
+                {0xb8, 4, "usb2-ahb",    },  /* USB2 AHB从属时钟 */
+                {0xb8, 6, "usb2-utmi",   },  /* USB2 UTMI接口时钟 */
+                {0xbc, 0, "usb2-phy",    },  /* USB2 PHY时钟 */
+                /* 网卡时钟 */
                 {0xd0, 0, "femac-bus",   },  /* FEMAC以太网总线时钟 */
                 {0xd0, 1, "femac-mac",   },  /* FEMAC以太网MAC工作时钟 */
                 {0xd0, 2, "femac-mdio",  },  /* FEMAC MDIO总线时钟 */
-                {0xd0, 4, "i2c0-bus",    },  /* I2C0总线时钟（已验证正确） */
+                /* I2C时钟：开I2C0和I2C2 */
+                {0xd0, 4, "i2c0-bus",    },  /* I2C0总线时钟（RTC在这路） */
+                {0xd0, 5, "i2c1-bus",    },  /* I2C1总线时钟 */
+                {0xd0, 6, "i2c2-bus",    },  /* I2C2总线时钟（ES8316在这路！） */
                 {0x388,0, "fephy",       },  /* FEPHY百兆PHY时钟 */
                 {0x118,0, "aiao-bus",    },  /* AIAO音频总线时钟 */
                 {0x118,1, "aiao-mod",    },  /* AIAO音频模块时钟 */
             };
-
 
             /* Reset lines: registered for per-driver use, we never trigger bulk reset */
             static const struct { u32 off; u8 bit; } gk_resets[] = {
