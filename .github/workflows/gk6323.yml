@@ -263,30 +263,32 @@ jobs:
             // SPDX-License-Identifier: GPL-2.0
             /*
              * Goke GK6323V100C CRG Clock and Reset Driver
-             * Minimal driver for peripheral clock gates and reset lines
+             * Minimal driver: ONLY enable peripheral clock gates, DO NOT reset anything!
+             * U-Boot has already initialized all peripherals at boot time, Linux must not
+             * reset them again (would break eMMC/USB already configured by bootloader).
+             * Reset controller is registered for peripheral drivers to request resets
+             * individually via devicetree "resets" properties, but we never do bulk reset.
              */
             #include <linux/init.h>
             #include <linux/module.h>
             #include <linux/io.h>
             #include <linux/of.h>
-            #include <linux/platform_device.h>
-            #include <linux/clk-provider.h>
+            #include <linux/of_address.h>
             #include <linux/reset-controller.h>
             #include <linux/bitops.h>
             #include <linux/delay.h>
             #include <linux/spinlock.h>
-            #include "gk6323v100c-resets.h"
 
-            static DEFINE_SPINLOCK(gk_crg_lock);
             struct gk_crg_priv {
                 void __iomem *base;
                 struct reset_controller_dev rcdev;
-                /* clk_data 内含柔性数组 hws[]，必须放在结构体最后：
-                 * 否则 hws[i] 的写入会越过它去踩紧随其后的 rcdev。 */
-                struct clk_hw_onecell_data clk_data;
             };
 
-            /* 外设时钟门控表：(偏移, 位号, 名称)，写1=开时钟，写0=关时钟 */
+            static DEFINE_SPINLOCK(gk_crg_lock);
+
+            /* 外设时钟门控表：(偏移, 位号, 名称)，写1=开时钟，写0=关时钟
+             * 只开门控，不碰任何复位位，不破坏U-Boot初始化状态
+             */
             static const struct { u32 off; u8 bit; const char *name; } gk_gates[] = {
                 {0xa0, 0, "emmc-bus",    },  /* eMMC AHB总线时钟 */
                 {0xa0, 1, "emmc-ciu",    },  /* eMMC CIU工作时钟 */
@@ -306,7 +308,10 @@ jobs:
                 {0x118,1, "aiao-mod",    },  /* AIAO音频模块时钟 */
             };
 
-            /* 外设复位表：(偏移, 位号)，高电平复位：写1=按住，写0=释放 */
+            /* 外设复位表：(偏移, 位号)，高电平复位：写1=按住，写0=释放
+             * 注意：我们不在probe里主动复位任何外设！这个表只给外设驱动单独
+             * 调用reset_control_assert/deassert时用。
+             */
             static const struct { u32 off; u8 bit; } gk_resets[] = {
                 {0xa0, 0},  /* EMMC */
                 {0xa0, 1},  /* EMMC_BUS */
@@ -318,24 +323,37 @@ jobs:
                 {0xbc, 0},  /* USB_PHY */
                 {0xd0, 3},  /* FEMAC */
                 {0xd0, 4},  /* I2C0 */
-                {0x118,1},  /* AIAO */
+                {0x118,1},  /* AIAO mod reset */
+                {0x118,4},  /* AIAO bus reset (匹配dts里的<&cru 0x118 4>) */
             };
+
+            static struct gk_crg_priv *gk_crg_global;
 
             static int gk_crg_assert(struct reset_controller_dev *rcdev, unsigned long id)
             {
                 struct gk_crg_priv *priv = container_of(rcdev, struct gk_crg_priv, rcdev);
-                u32 val = readl_relaxed(priv->base + gk_resets[id].off);
+                unsigned long flags;
+                u32 val;
+
+                spin_lock_irqsave(&gk_crg_lock, flags);
+                val = readl_relaxed(priv->base + gk_resets[id].off);
                 val |= BIT(gk_resets[id].bit);
                 writel_relaxed(val, priv->base + gk_resets[id].off);
+                spin_unlock_irqrestore(&gk_crg_lock, flags);
                 return 0;
             }
 
             static int gk_crg_deassert(struct reset_controller_dev *rcdev, unsigned long id)
             {
                 struct gk_crg_priv *priv = container_of(rcdev, struct gk_crg_priv, rcdev);
-                u32 val = readl_relaxed(priv->base + gk_resets[id].off);
+                unsigned long flags;
+                u32 val;
+
+                spin_lock_irqsave(&gk_crg_lock, flags);
+                val = readl_relaxed(priv->base + gk_resets[id].off);
                 val &= ~BIT(gk_resets[id].bit);
                 writel_relaxed(val, priv->base + gk_resets[id].off);
+                spin_unlock_irqrestore(&gk_crg_lock, flags);
                 return 0;
             }
 
@@ -361,6 +379,7 @@ jobs:
                     if (gk_resets[i].off == off && gk_resets[i].bit == bit)
                         return i;
                 }
+                pr_warn("GK6323V100C CRG: requested reset (0x%x, bit%u) not in table\n", off, bit);
                 return -ENOENT;
             }
 
@@ -370,7 +389,7 @@ jobs:
                 .reset = gk_crg_reset,
             };
 
-            static int gk_crg_probe(struct platform_device *pdev)
+            static int __init gk_crg_probe(struct platform_device *pdev)
             {
                 struct device *dev = &pdev->dev;
                 struct gk_crg_priv *priv;
@@ -378,60 +397,31 @@ jobs:
                 int i, ret;
                 u32 val;
 
-                /* 进入 probe 第一句就打印：刷机后 dmesg 里若连这句都没有，说明驱动
-                 * 压根没被 probe（多半是 dts 的 compatible 或节点没对上），而不是
-                 * 内部逻辑失败 —— 一步就能定位方向。 */
-                dev_info(dev, "GK6323V100C CRG: probe entered (goke,gk6323v100c-cru)\n");
+                pr_info("GK6323V100C CRG: probe entered\n");
 
                 base = devm_platform_ioremap_resource(pdev, 0);
                 if (IS_ERR(base))
                     return PTR_ERR(base);
 
-                priv = devm_kzalloc(dev, struct_size(priv, clk_data.hws, ARRAY_SIZE(gk_gates)),
-                                   GFP_KERNEL);
+                priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
                 if (!priv) return -ENOMEM;
 
                 priv->base = base;
+                gk_crg_global = priv;
 
-                /* 1. 打开所有外设时钟门控 */
+                /* 【核心改动】只打开所有外设时钟门控，绝不主动复位任何外设！
+                 * U-Boot已经完成了所有外设复位和初始化，Linux再批量复位只会搞乱状态、
+                 * 导致eMMC/USB等已经工作的外设失效。
+                 * 时钟门必须开，因为U-Boot打开的门控在Linux启动后可能被时钟框架关掉，
+                 * 但复位线绝对不能碰。
+                 */
                 for (i = 0; i < ARRAY_SIZE(gk_gates); i++) {
                     val = readl_relaxed(base + gk_gates[i].off);
                     val |= BIT(gk_gates[i].bit);
                     writel_relaxed(val, base + gk_gates[i].off);
                 }
 
-                /* 2. 复位所有外设：先全部按住，再全部释放，保证时序正确 */
-                for (i = 0; i < ARRAY_SIZE(gk_resets); i++) {
-                    val = readl_relaxed(base + gk_resets[i].off);
-                    val |= BIT(gk_resets[i].bit);
-                    writel_relaxed(val, base + gk_resets[i].off);
-                }
-                msleep(10); /* 按住10ms，满足所有外设复位脉宽要求 */
-                for (i = 0; i < ARRAY_SIZE(gk_resets); i++) {
-                    val = readl_relaxed(base + gk_resets[i].off);
-                    val &= ~BIT(gk_resets[i].bit);
-                    writel_relaxed(val, base + gk_resets[i].off);
-                }
-                msleep(50); /* 释放后等待50ms，等待外设PLL锁定 */
-
-                /* 3. 注册时钟provider */
-                for (i = 0; i < ARRAY_SIZE(gk_gates); i++) {
-                    priv->clk_data.hws[i] = clk_hw_register_gate(dev, gk_gates[i].name,
-                        NULL, CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
-                        base + gk_gates[i].off, gk_gates[i].bit, 0, &gk_crg_lock);
-                    if (IS_ERR(priv->clk_data.hws[i]))
-                        return dev_err_probe(dev, PTR_ERR(priv->clk_data.hws[i]),
-                                            "failed to register gate %s\n", gk_gates[i].name);
-                }
-                priv->clk_data.num = ARRAY_SIZE(gk_gates);
-                ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, &priv->clk_data);
-                if (ret)
-                    /* 只告警、不中止：时钟门在更早的循环里已直接写寄存器打开，没有
-                     * 消费者按 clk 名字查这些门；在这里中断会连复位控制器一起丢掉，
-                     * 而复位控制器才是 dts 真正引用的东西（resets = <&cru ...>）。 */
-                    dev_warn(dev, "GK6323V100C CRG: clk provider 注册失败(%d)，门控已直接打开，继续注册复位控制器\n", ret);
-
-                /* 4. 注册复位控制器 */
+                /* 注册复位控制器，提供给外设驱动单独调用复位，不主动触发任何复位 */
                 priv->rcdev.ops = &gk_crg_reset_ops;
                 priv->rcdev.owner = THIS_MODULE;
                 priv->rcdev.dev = dev;
@@ -440,10 +430,13 @@ jobs:
                 priv->rcdev.of_reset_n_cells = 2;
                 priv->rcdev.of_xlate = gk_crg_of_xlate;
                 ret = devm_reset_controller_register(dev, &priv->rcdev);
-                if (ret) return ret;
+                if (ret) {
+                    pr_err("GK6323V100C CRG: failed to register reset controller: %d\n", ret);
+                    return ret;
+                }
 
-                dev_info(dev, "GK6323V100C CRG: %zu gates enabled, %zu resets released (active high, cells=2)\n",
-                         ARRAY_SIZE(gk_gates), ARRAY_SIZE(gk_resets));
+                pr_info("GK6323V100C CRG: %zu clock gates enabled, reset controller registered (no bulk reset, U-Boot state preserved)\n",
+                        ARRAY_SIZE(gk_gates));
                 return 0;
             }
 
@@ -462,13 +455,14 @@ jobs:
                 },
             };
 
+            /* 使用arch_initcall_sync保证在所有外设driver probe之前完成时钟门开启 */
             static int __init gk_crg_init(void)
             {
                 return platform_driver_register(&gk_crg_driver);
             }
             arch_initcall_sync(gk_crg_init);
 
-            MODULE_DESCRIPTION("Goke GK6323V100C CRG clock and reset driver");
+            MODULE_DESCRIPTION("Goke GK6323V100C CRG clock gate and reset controller driver");
             MODULE_LICENSE("GPL");
             CEOF
 
