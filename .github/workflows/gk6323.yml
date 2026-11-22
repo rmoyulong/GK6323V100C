@@ -273,6 +273,7 @@ jobs:
              *   2. AIAO audio controller (0x118 bit0/bit1) - so the onboard ES8316 soundcard probes
              */
             #include <linux/init.h>
+            #include <linux/delay.h>
             #include <linux/module.h>
             #include <linux/io.h>
             #include <linux/of.h>
