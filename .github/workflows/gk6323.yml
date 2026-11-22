@@ -235,199 +235,68 @@ jobs:
         run: |
             set -euo pipefail
             cd linux_build/drivers/clk/hisilicon
-          
-            # 写入头文件 gk6323v100c-resets.h
-            cat > gk6323v100c-resets.h << 'CEOF'
-            /* SPDX-License-Identifier: GPL-2.0 */
-            #ifndef __GK6323V100C_RESETS_H
-            #define __GK6323V100C_RESETS_H
 
-            /* GK6323V100C CRG reset bits - 高电平复位：写1=按住，写0=释放 */
-            #define GK6323V100C_RESET_EMMC     0  /* 0xa0 bit0 eMMC总线复位 */
-            #define GK6323V100C_RESET_EMMC_BUS 1  /* 0xa0 bit1 eMMC CIU复位 */
-            #define GK6323V100C_RESET_USB2_0   0  /* 0xb8 bit0 USB2 CTRL0复位 */
-            #define GK6323V100C_RESET_USB2_1   1  /* 0xb8 bit1 USB2 CTRL1复位 */
-            #define GK6323V100C_RESET_USB2_2   2  /* 0xb8 bit2 USB2 CTRL2复位 */
-            #define GK6323V100C_RESET_USB2_BUS 3  /* 0xb8 bit3 USB2总线复位 */
-            #define GK6323V100C_RESET_USB2_UTMI 6 /* 0xb8 bit6 USB2 UTMI复位 */
-            #define GK6323V100C_RESET_USB_PHY  0  /* 0xbc bit0 USB PHY复位 */
-            #define GK6323V100C_RESET_I2C0     4  /* 0xd0 bit4 I2C0总线复位 */
-            #define GK6323V100C_RESET_FEMAC    3  /* 0xd0 bit3 FEMAC MAC复位 */
-            #define GK6323V100C_RESET_AIAO     0  /* 0x118 bit1 AIAO音频控制器复位 */
-
-            #endif
-            CEOF
-
-            # 写入驱动文件 crg-gk6323v100c.c
+            # 写入极简驱动文件：只开FEPHY时钟，不注册reset控制器，不碰其他寄存器
             cat > crg-gk6323v100c.c << 'CEOF'
             // SPDX-License-Identifier: GPL-2.0
             /*
-             * Goke GK6323V100C CRG Clock and Reset Driver
-             * ABSOLUTELY MINIMAL: ONLY enable clocks that U-Boot does NOT initialize.
-             * All other peripherals (eMMC/USB/Ethernet MAC/I2C) are already configured by U-Boot,
-             * writing ANY bits to their CRG registers will break them (either resetting them
-             * or disabling clocks that U-Boot set up).
+             * Goke GK6323V100C CRG Clock Driver - ABSOLUTELY MINIMAL
              *
-             * Only two blocks need clocks enabled in Linux:
-             *   1. FEPHY (0x388 bit0) - so the Ethernet PHY can be enumerated over MDIO
-             *   2. AIAO audio controller (0x118 bit0/bit1) - so the onboard ES8316 soundcard probes
+             * Key insight from boot logs:
+             * - U-Boot already initializes eMMC/USB/Ethernet MAC/I2C/audio (prints "Net: up")
+             * - clk_ignore_unused keeps U-Boot-enabled clocks running
+             * - Registering a reset controller causes peripheral drivers to reset devices,
+             *   breaking U-Boot's working configuration
+             * - Writing ANY bits to 0xa0/0xb8/0xbc/0xd0/0x118 overwrites U-Boot settings
+             *
+             * The ONLY thing we need to do is enable the FEPHY clock (0x388 bit0),
+             * which is required for MDIO to read the PHY ID. We do NOT register a reset
+             * controller, and we do NOT touch any other CRG registers.
              */
             #include <linux/init.h>
-            #include <linux/delay.h>
             #include <linux/module.h>
             #include <linux/io.h>
             #include <linux/of.h>
             #include <linux/of_address.h>
             #include <linux/clk-provider.h>
-            #include <linux/reset-controller.h>
             #include <linux/bitops.h>
-            #include <linux/slab.h>
 
-            struct gk_crg_priv {
-                void __iomem *base;
-                struct reset_controller_dev rcdev;
-            };
-
-            static DEFINE_SPINLOCK(gk_crg_lock);
-            static struct gk_crg_priv *gk_crg_global;
-
-            /* 时钟门控表：增加active_low字段，true=写0开时钟，false=写1开时钟
-             * 复位位统一是写1=按住、写0=释放，写0开时钟同时也释放复位，正好正确
-             */
-            static const struct { u32 off; u8 bit; const char *name; bool active_low; } gk_gates[] = {
-                /* ✅ eMMC：高电平有效（已验证写1开正常） */
-                {0xa0, 0, "emmc-bus",    false},
-                {0xa0, 1, "emmc-ciu",    false},
-                /* ✅ USB时钟：低电平有效，写0开时钟同时释放复位，不按住外设 */
-                {0xb8, 0, "usb2-ctrl0",  true},
-                {0xb8, 1, "usb2-ctrl1",  true},
-                {0xb8, 2, "usb2-ctrl2",  true},
-                {0xb8, 3, "usb2-bus",    true},
-                {0xb8, 4, "usb2-ahb",    true},
-                {0xb8, 6, "usb2-utmi",   true},
-                {0xbc, 0, "usb2-phy",    true},
-                /* ✅ 网卡+I2C时钟：低电平有效，写0开时钟+释放复位 */
-                {0xd0, 0, "femac-bus",   true},
-                {0xd0, 1, "femac-mac",   true},
-                {0xd0, 2, "femac-mdio",  true},
-                {0xd0, 3, "femac-reset", true},  /* FEMAC复位位：写0释放 */
-                {0xd0, 4, "i2c0-bus",    true},
-                {0xd0, 5, "i2c1-bus",    true},
-                {0xd0, 6, "i2c2-bus",    true},
-                /* ✅ FEPHY网卡PHY时钟：低电平有效，写0开 */
-                {0x388,0, "fephy",       true},
-                /* AIAO声卡时钟：U-Boot已经开成0，不需要碰，声卡已正常工作 */
-            };
-
-            /* 复位表保留，但我们永远不主动触发任何复位，只给外设驱动单独查询用 */
-            static const struct { u32 off; u8 bit; } gk_resets[] = {
-                {0xd0, 3}, {0x118,4},  /* 只保留dts里实际引用的两个复位 */
-            };
-
-            static int gk_crg_assert(struct reset_controller_dev *rcdev, unsigned long id)
-            {
-                struct gk_crg_priv *priv = container_of(rcdev, struct gk_crg_priv, rcdev);
-                unsigned long flags; u32 val;
-                spin_lock_irqsave(&gk_crg_lock, flags);
-                val = readl_relaxed(priv->base + gk_resets[id].off);
-                val |= BIT(gk_resets[id].bit);
-                writel_relaxed(val, priv->base + gk_resets[id].off);
-                spin_unlock_irqrestore(&gk_crg_lock, flags);
-                return 0;
-            }
-
-            static int gk_crg_deassert(struct reset_controller_dev *rcdev, unsigned long id)
-            {
-                struct gk_crg_priv *priv = container_of(rcdev, struct gk_crg_priv, rcdev);
-                unsigned long flags; u32 val;
-                spin_lock_irqsave(&gk_crg_lock, flags);
-                val = readl_relaxed(priv->base + gk_resets[id].off);
-                val &= ~BIT(gk_resets[id].bit);
-                writel_relaxed(val, priv->base + gk_resets[id].off);
-                spin_unlock_irqrestore(&gk_crg_lock, flags);
-                return 0;
-            }
-
-            static int gk_crg_reset(struct reset_controller_dev *rcdev, unsigned long id)
-            {
-                gk_crg_assert(rcdev, id); udelay(10);
-                gk_crg_deassert(rcdev, id); udelay(50);
-                return 0;
-            }
-
-            static int gk_crg_of_xlate(struct reset_controller_dev *rcdev,
-                                       const struct of_phandle_args *reset_spec)
-            {
-                u32 off = reset_spec->args[0], bit = reset_spec->args[1];
-                int i;
-                if (reset_spec->args_count != 2) return -EINVAL;
-                for (i = 0; i < ARRAY_SIZE(gk_resets); i++)
-                    if (gk_resets[i].off == off && gk_resets[i].bit == bit) return i;
-                return -ENOENT;
-            }
-
-            static const struct reset_control_ops gk_crg_reset_ops = {
-                .assert = gk_crg_assert,
-                .deassert = gk_crg_deassert,
-                .reset = gk_crg_reset,
-            };
+            static void __iomem *gk_crg_base;
 
             static void __init gk_crg_early_init(struct device_node *np)
             {
-                struct gk_crg_priv *priv;
-                void __iomem *base;
-                int i, ret; u32 val;
+                u32 val;
 
-                pr_info("GK6323V100C CRG: early init started (minimal, no bulk reset)\n");
+                pr_info("GK6323V100C CRG: early init (clock-only, no reset controller)\n");
 
-                base = of_iomap(np, 0);
-                if (!base) { pr_err("CRG: iomap failed\n"); return; }
-
-                priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-                if (!priv) { iounmap(base); return; }
-                priv->base = base;
-                gk_crg_global = priv;
-
-                /* 然后修改开时钟的循环逻辑，按极性处理 */
-                for (i = 0; i < ARRAY_SIZE(gk_gates); i++) {
-                    val = readl_relaxed(base + gk_gates[i].off);
-                    if (gk_gates[i].active_low)
-                        val &= ~BIT(gk_gates[i].bit); /* 低电平有效：清0开时钟/释放复位 */
-                    else
-                        val |= BIT(gk_gates[i].bit);  /* 高电平有效：置1开时钟 */
-                    writel_relaxed(val, base + gk_gates[i].off);
+                gk_crg_base = of_iomap(np, 0);
+                if (!gk_crg_base) {
+                    pr_err("CRG: iomap failed\n");
+                    return;
                 }
 
-                /* 注册复位控制器，不主动触发任何复位 */
-                priv->rcdev.ops = &gk_crg_reset_ops;
-                priv->rcdev.owner = NULL;
-                priv->rcdev.of_node = np;
-                priv->rcdev.nr_resets = ARRAY_SIZE(gk_resets);
-                priv->rcdev.of_reset_n_cells = 2;
-                priv->rcdev.of_xlate = gk_crg_of_xlate;
-                ret = reset_controller_register(&priv->rcdev);
-                if (ret) { pr_err("CRG: reset register failed: %d\n", ret); iounmap(base); kfree(priv); return; }
+                /* Enable FEPHY clock only - required for MDIO to read PHY ID.
+                 * All other peripherals are already clocked and initialized by U-Boot,
+                 * and clk_ignore_unused preserves those clocks.
+                 */
+                val = readl_relaxed(gk_crg_base + 0x388);
+                val |= BIT(0);
+                writel_relaxed(val, gk_crg_base + 0x388);
 
-                pr_info("GK6323V100C CRG: %zu clock gates enabled (fephy + aiao), U-Boot peripheral state fully preserved\n",
-                        ARRAY_SIZE(gk_gates));
+                pr_info("GK6323V100C CRG: FEPHY clock enabled, U-Boot state fully preserved\n");
             }
-
             CLK_OF_DECLARE_DRIVER(gk6323v100c_cru, "goke,gk6323v100c-cru", gk_crg_early_init);
             CLK_OF_DECLARE_DRIVER(gk6323v100c_crg, "goke,gk6323v100c-crg", gk_crg_early_init);
 
             MODULE_DESCRIPTION("Goke GK6323V100C minimal CRG clock driver");
             MODULE_LICENSE("GPL");
-
             CEOF
 
-            # ★ 本步骤只负责把两个源文件放进内核树；Kconfig / Makefile 的登记
-            #   交给紧随其后的「追加 … （幂等）」步骤，避免同一步里既写文件又改配置。
-            #   硬校验：源文件必须真的落盘，否则后面 Makefile 里的 obj- 目标会让
-            #   make 直接报 No rule to make target 'crg-gk6323v100c.o'。
-            test -f crg-gk6323v100c.c    || { echo "::error::crg-gk6323v100c.c 未写入内核树"; exit 1; }
-            test -f gk6323v100c-resets.h || { echo "::error::gk6323v100c-resets.h 未写入内核树"; exit 1; }
-            ls -l crg-gk6323v100c.c gk6323v100c-resets.h
-            echo "OK  GK6323V100C CRG 驱动源码已写入内核树（两文件均已确认存在）"
+            # 硬校验：源文件必须真的落盘
+            test -f crg-gk6323v100c.c || { echo "::error::crg-gk6323v100c.c 未写入内核树"; exit 1; }
+            ls -l crg-gk6323v100c.c
+            echo "OK GK6323V100C CRG 驱动源码已写入内核树"
+            
       - name: 追加 GK6323 CRG 驱动到 Kconfig / Makefile（幂等）
         run: |
           set -euo pipefail
