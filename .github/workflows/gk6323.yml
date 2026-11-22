@@ -292,30 +292,16 @@ jobs:
             static struct gk_crg_priv *gk_crg_global;
 
             static const struct { u32 off; u8 bit; const char *name; } gk_gates[] = {
-                /* ✅ eMMC时钟门（低bit，纯时钟，不是复位） */
+                /* ✅ 唯一验证正确的时钟位：eMMC正常工作，保留 */
                 {0xa0, 0, "emmc-bus",    },
                 {0xa0, 1, "emmc-ciu",    },
-                /* ✅ USB时钟门（0xb8/0xbc低bit全是时钟门，写1开，不是复位位！之前误删导致USB失败） */
-                {0xb8, 0, "usb2-ctrl0",  },
-                {0xb8, 1, "usb2-ctrl1",  },
-                {0xb8, 2, "usb2-ctrl2",  },
-                {0xb8, 3, "usb2-bus",    },
-                {0xb8, 4, "usb2-ahb",    },
-                {0xb8, 6, "usb2-utmi",   },
-                {0xbc, 0, "usb2-phy",    },
-                /* ✅ 网卡时钟门（0xd0低3位是时钟，bit3是复位位绝对不能碰！） */
-                {0xd0, 0, "femac-bus",   },
-                {0xd0, 1, "femac-mac",   },
-                {0xd0, 2, "femac-mdio",  },
-                /* ✅ I2C时钟门（0xd0 bit4/5/6是三路I2C时钟，不是复位位） */
-                {0xd0, 4, "i2c0-bus",    },
-                {0xd0, 5, "i2c1-bus",    },
-                {0xd0, 6, "i2c2-bus",    },
-                /* ✅ FEPHY网卡PHY时钟 + AIAO声卡时钟 */
-                {0x388,0, "fephy",       },
-                {0x118,0, "aiao-bus",    },
-                {0x118,1, "aiao-mod",    },
+                /* 🔴 其他所有寄存器（0xb8/0xbc/0xd0/0x388/0x118）的位一律不写！
+                 * 这些位要么是复位位（写1按住外设），要么极性相反（写1关时钟），
+                 * 乱写会破坏U-Boot初始化好的USB/I2C/网卡状态。
+                 * 没有CRG驱动时这些外设本来就正常工作，clk_ignore_unused会保持时钟开启。
+                 */
             };
+
 
 
             /* 复位表保留，但我们永远不主动触发任何复位，只给外设驱动单独查询用 */
