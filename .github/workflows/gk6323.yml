@@ -245,10 +245,6 @@ jobs:
           # subsys_initcall 在所有 device_initcall 外设（femac/ehci/ohci/i2c/es8316）
           # probe 前执行，时钟门一定先开；显式开 femac/ehci/ohci/i2c/eMMC/aiao/uart
           # 13 路时钟门（read-modify-write，不清其他位），不会按死 U-Boot 已开的模块。
-          # 本驱动用 platform_driver + subsys_initcall（不依赖 clk-of 私有宏）：
-          # subsys_initcall 在所有 device_initcall 外设（femac/ehci/ohci/i2c/es8316）
-          # probe 前执行，时钟门一定先开；显式开 femac/ehci/ohci/i2c/eMMC/aiao/uart/FEPHY
-          # 时钟门 + 主动 deassert 软复位（read-modify-write，不清其他位）。
           # 寄存器位号取自海思 BSP hi3798mv310-clock.h 与 clk-hiusb2.c（与 GK6323V100C 同源）：
           #   0x08 (PERI_CRG0x08 / UART0 位)        : BIT(0) 时钟
           #   0x68 (PERI_CRG26_UART)               : UART0 复位
@@ -257,9 +253,9 @@ jobs:
           #   0xb8 (PERI_CRG46_USB2CTRL)           : BUS@0, OHCI48M@1, OHCI12M@2, UTMI@3, HST_PHY@4, UTMI0@5;
           #                                         BUS_SRST@12, UTMI0_SRST@13, HST_PHY_SRST@16
           #   0xbc (PERI_CRG47_USB2PHY)            : PHY_REF@0; PHY_SRST@4, PHY0_TREQ@8
-          #   0xcc (PERI_CRG51_GSF = FEMAC)        : FEMAC 时钟 + mac_rst@3
+          #   0xcc (PERI_CRG51_GSF)               : 千兆口 higmac 寄存器（本板百兆口不用，只读不碰）
           #   0x118 (PERI_CRG70_AIAO)              : AIAO clk; rst@4
-          #   0x120 (PERI_CRG72_FEPHY)             : FEPHY 参考时钟
+          #   0x388 (FEPHY 寄存器)                 : FEPHY 参考时钟（真机实测 0xf8a22388 = 0x1）
           #
           # 复位语义：assert 置位、deassert 清位（与海思 reset-hisilicon.c 一致），本驱动在
           # probe 时主动 deassert 所有下面的外设复位，让它们从 U-Boot 交棒的"未知/复位中"
@@ -462,7 +458,7 @@ jobs:
           	udelay(10);
           	writel_relaxed(val & ~BIT(4), priv->base + 0x388);
           	readl_relaxed(priv->base + 0x388);
-          	udelay(20000);
+          	mdelay(20);
 
           	for (i = 0; i < ARRAY_SIZE(gk_clocks); i++)
           		pos += snprintf(log + pos, sizeof(log) - pos,
@@ -478,7 +474,7 @@ jobs:
           	priv->rcdev.owner           = THIS_MODULE;
           	priv->rcdev.ops             = &gk_reset_ops;
           	priv->rcdev.of_node         = np;
-          	priv->rcdev.nr_resets       = 0xfff * 32;
+          	priv->rcdev.nr_resets       = 0x1000U << 16;
           	priv->rcdev.of_reset_n_cells = 2;
           	priv->rcdev.of_xlate        = gk_reset_of_xlate;
           	ret = devm_reset_controller_register(dev, &priv->rcdev);
