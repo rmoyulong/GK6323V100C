@@ -9,11 +9,11 @@
  *      新增的驱动认的 "goke,gk6323v100c-crg"，只提供 #reset-cells = <2>
  *      （寄存器偏移, 位号）。该驱动在 probe 时直接把 eMMC / USB2 / FEMAC
  *      三组时钟门控写开、软复位放开；
- *   2) femac 节点补上 resets = <&cru 0xd0 3>; reset-names = "mac";
+ *   2) femac 节点补上 resets = <&cru 0xd0 3>, <&cru 0x388 4>;
+ *      reset-names = "mac", "phy";
  *      —— hisi_femac 驱动对 "mac" 复位是强制要求，缺了它 probe 直接失败
- *      （真机日志里那条 hisi-femac ... failed with error -2 就是它）；
- *      只给 "mac"，不给 "phy"：给了 "phy" 之后驱动会去读
- *      hisilicon,phy-reset-* 延时属性，属性不存在会让 probe 直接失败。
+ *      （真机日志里那条 hisi-femac ... failed with error -2 就是它），
+ *      并在 "phy" 复位上按 hisilicon,phy-reset-delays-us 做完整 PHY 复位；
  *   3) 补回 vdp@7f000000 保留区（16MB）：U-Boot 把开机 logo 的帧缓冲放在
  *      0x7f511000，内核若把这块当普通内存分配会立刻盖掉画面（花屏）。
  *
@@ -269,18 +269,22 @@
 		 *      —— 地址写成 2 时 MDIO 读到全 0（phy_id=0x00000000）。
 		 *   2) "mac" 软复位在 CRG 0xd0 bit3，不是 0xcc bit3。hisi_femac 对
 		 *      "mac" 是强制要求，缺了 probe 直接 -ENOENT。
-		 *   3) FEPHY 的时钟/复位都在 CRG 0x388：bit0 是时钟、bit4 是复位
-		 *      （真机实测该寄存器外释放后为 0x1）。复位时序由 CRG 驱动在
-		 *      probe 里按原厂 bootloader 的序列完成，这里因此不再声明 "phy"，
-		 *      避免 hisi_femac 在 MAC 侧时钟未关的状态下重复做一次 PHY 复位。
+		 *   3) FEPHY 的时钟/复位都在 CRG 0x388：bit0 是时钟、bit4 是复位。
+		 *      主线 hi3798mv200 的 femac 节点写的是
+		 *        resets = <&crg 0xd0 3>, <&crg 0x388 4>;
+		 *        reset-names = "mac", "phy";
+		 *      hisi_femac 只在取名 "phy" 的复位上做一次完整 PHY 复位
+		 *      （按 hisilicon,phy-reset-delays-us 的 10ms/10ms/500ms），
+		 *      并在复位前后关闭、重开 MAC 侧时钟。此前这里只给了 "mac"，
+		 *      PHY 从未被正统复位过，自协商因此停在 10Mbps/Half。照主线补齐。
 		 */
 		femac: ethernet@f9c30000 {
 			compatible = "hisilicon,hisi-femac-v2";
 			reg = <0xf9c30000 0x1000>, <0xf9c31300 0x300>;
 			interrupts = <0 72 4>;
 			clocks = <&clk_75m>;
-			resets = <&cru 0xd0 3>;
-			reset-names = "mac";
+			resets = <&cru 0xd0 3>, <&cru 0x388 4>;
+			reset-names = "mac", "phy";
 			hisilicon,phy-reset-delays-us = <10000 10000 500000>;
 			phy-mode = "mii";
 			phy-handle = <&fephy>;
