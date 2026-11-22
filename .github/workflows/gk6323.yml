@@ -291,18 +291,33 @@ jobs:
             static DEFINE_SPINLOCK(gk_crg_lock);
             static struct gk_crg_priv *gk_crg_global;
 
-            static const struct { u32 off; u8 bit; const char *name; } gk_gates[] = {
-                /* ✅ 唯一验证正确的时钟位：eMMC正常工作，保留 */
-                {0xa0, 0, "emmc-bus",    },
-                {0xa0, 1, "emmc-ciu",    },
-                /* 🔴 其他所有寄存器（0xb8/0xbc/0xd0/0x388/0x118）的位一律不写！
-                 * 这些位要么是复位位（写1按住外设），要么极性相反（写1关时钟），
-                 * 乱写会破坏U-Boot初始化好的USB/I2C/网卡状态。
-                 * 没有CRG驱动时这些外设本来就正常工作，clk_ignore_unused会保持时钟开启。
-                 */
+            /* 时钟门控表：增加active_low字段，true=写0开时钟，false=写1开时钟
+             * 复位位统一是写1=按住、写0=释放，写0开时钟同时也释放复位，正好正确
+             */
+            static const struct { u32 off; u8 bit; const char *name; bool active_low; } gk_gates[] = {
+                /* ✅ eMMC：高电平有效（已验证写1开正常） */
+                {0xa0, 0, "emmc-bus",    false},
+                {0xa0, 1, "emmc-ciu",    false},
+                /* ✅ USB时钟：低电平有效，写0开时钟同时释放复位，不按住外设 */
+                {0xb8, 0, "usb2-ctrl0",  true},
+                {0xb8, 1, "usb2-ctrl1",  true},
+                {0xb8, 2, "usb2-ctrl2",  true},
+                {0xb8, 3, "usb2-bus",    true},
+                {0xb8, 4, "usb2-ahb",    true},
+                {0xb8, 6, "usb2-utmi",   true},
+                {0xbc, 0, "usb2-phy",    true},
+                /* ✅ 网卡+I2C时钟：低电平有效，写0开时钟+释放复位 */
+                {0xd0, 0, "femac-bus",   true},
+                {0xd0, 1, "femac-mac",   true},
+                {0xd0, 2, "femac-mdio",  true},
+                {0xd0, 3, "femac-reset", true},  /* FEMAC复位位：写0释放 */
+                {0xd0, 4, "i2c0-bus",    true},
+                {0xd0, 5, "i2c1-bus",    true},
+                {0xd0, 6, "i2c2-bus",    true},
+                /* ✅ FEPHY网卡PHY时钟：低电平有效，写0开 */
+                {0x388,0, "fephy",       true},
+                /* AIAO声卡时钟：U-Boot已经开成0，不需要碰，声卡已正常工作 */
             };
-
-
 
             /* 复位表保留，但我们永远不主动触发任何复位，只给外设驱动单独查询用 */
             static const struct { u32 off; u8 bit; } gk_resets[] = {
@@ -373,10 +388,13 @@ jobs:
                 priv->base = base;
                 gk_crg_global = priv;
 
-                /* 只开3个必要的时钟门，绝对不碰其他寄存器，不破坏U-Boot状态 */
+                /* 然后修改开时钟的循环逻辑，按极性处理 */
                 for (i = 0; i < ARRAY_SIZE(gk_gates); i++) {
                     val = readl_relaxed(base + gk_gates[i].off);
-                    val |= BIT(gk_gates[i].bit);
+                    if (gk_gates[i].active_low)
+                        val &= ~BIT(gk_gates[i].bit); /* 低电平有效：清0开时钟/释放复位 */
+                    else
+                        val |= BIT(gk_gates[i].bit);  /* 高电平有效：置1开时钟 */
                     writel_relaxed(val, base + gk_gates[i].off);
                 }
 
