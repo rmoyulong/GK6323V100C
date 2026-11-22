@@ -369,6 +369,11 @@ jobs:
           	unsigned long flags;
           	u32 val;
           	spin_lock_irqsave(&priv->lock, flags);
+          	if (off == 0x388 && bit == 4) {
+          		/* mv200：PHY 复位期间 MAC 侧时钟必须关闭 */
+          		val = readl_relaxed(priv->base + 0xd0);
+          		writel_relaxed(val & ~(BIT(0) | BIT(1)), priv->base + 0xd0);
+          	}
           	val = readl_relaxed(priv->base + off);
           	writel_relaxed(val | BIT(bit), priv->base + off);
           	spin_unlock_irqrestore(&priv->lock, flags);
@@ -386,6 +391,11 @@ jobs:
           	val = readl_relaxed(priv->base + off);
           	writel_relaxed(val & ~BIT(bit), priv->base + off);
           	readl_relaxed(priv->base + off); /* 屏障 */
+          	if (off == 0x388 && bit == 4) {
+          		/* PHY 复位释放后恢复 MAC 侧时钟 */
+          		val = readl_relaxed(priv->base + 0xd0);
+          		writel_relaxed(val | BIT(0) | BIT(1), priv->base + 0xd0);
+          	}
           	spin_unlock_irqrestore(&priv->lock, flags);
           	return 0;
           }
@@ -447,18 +457,16 @@ jobs:
           	udelay(100); /* USB/EHCI PHY PLL 锁定时间 */
 
           	/*
-          	 * 3) 内置 FEPHY 热复位，复刻原厂 bootloader 的序列
-          	 *    （CRG 0x388：bit0 时钟、bit4 复位）：
-          	 *      时钟开 -> 断言复位 -> 延时 10us -> 释放复位 -> 延时 20ms
-          	 *    20ms 是原厂 mdelay 序列给 PHY 内部 PLL 的锁定时间；
-          	 *    真机实测释放后 0xf8a22388 稳定读到 0x1。
+          	 * 3) FEPHY 复位不再由本驱动做：dts 已给 femac 补上
+          	 *      resets = <&cru 0xd0 3>, <&cru 0x388 4>;
+          	 *      reset-names = "mac", "phy";
+          	 *    hisi_femac 会按 hisilicon,phy-reset-delays-us
+          	 *    （10ms/10ms/500ms）对 0x388 bit4 做一次完整 PHY 复位，
+          	 *    并在复位前后经下面的 gk_reset_assert/deassert 关闭、
+          	 *    重开 MAC 侧时钟（0xd0 bit0/1）——这正是 mv200 硬件要求。
+          	 *    这里只保证 FEPHY 时钟门（0x388 bit0）已由上面的
+          	 *    gk_clocks 打开（由他自己释放或按时序复位）。
           	 */
-          	val = readl_relaxed(priv->base + 0x388);
-          	writel_relaxed(val | BIT(4), priv->base + 0x388);
-          	udelay(10);
-          	writel_relaxed(val & ~BIT(4), priv->base + 0x388);
-          	readl_relaxed(priv->base + 0x388);
-          	mdelay(20);
 
           	for (i = 0; i < ARRAY_SIZE(gk_clocks); i++)
           		pos += snprintf(log + pos, sizeof(log) - pos,
