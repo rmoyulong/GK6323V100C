@@ -284,6 +284,7 @@ jobs:
            */
 
           #include <linux/bitops.h>
+          #include <linux/clk-provider.h>
           #include <linux/gfp.h>
           #include <linux/io.h>
           #include <linux/init.h>
@@ -456,21 +457,22 @@ jobs:
           	pr_info("gk6323v100c-crg f8a22000: gates on [%s], reset cells=2\n", gate_log);
           }
 
-          static void __init gk_crg_of_init(struct device_node *np)
+          static int __init gk_crg_of_init(struct device_node *np)
           {
           	void __iomem *base;
           	base = of_iomap(np, 0);
           	if (!base) {
           		pr_err("gk6323v100c-crg: of_iomap failed\n");
-          		return;
+          		return -ENXIO;
           	}
           	gk_crg_setup(base, np);
-          	/* CLK_OF_DECLARE_DRIVER 语义：仍让 platform_driver 有机会后续 probe，
-          	 * 但我们的工作已经在 CLK 早期做完了；后续不再需要 platform_driver。 */
+          	/* CLK_OF_DECLARE 在 of_clk_init() 阶段一次性完成时钟门控 + 复位控制器
+          	 * 注册，不遗留 platform_driver 二次 probe，避免 probe 顺序依赖。 */
+          	return 0;
           }
 
-          CLK_OF_DECLARE_DRIVER(gk6323v100c_crg, "goke,gk6323v100c-crg", gk_crg_of_init);
-          CLK_OF_DECLARE_DRIVER(gk6323v100c_cru, "goke,gk6323v100c-cru", gk_crg_of_init);
+          CLK_OF_DECLARE(gk6323v100c_crg, "goke,gk6323v100c-crg", gk_crg_of_init);
+          CLK_OF_DECLARE(gk6323v100c_cru, "goke,gk6323v100c-cru", gk_crg_of_init);
 
           CEOF
           # Kconfig 追加本驱动符号（带幂等哨兵，重复跑只写一次）
