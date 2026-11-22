@@ -505,16 +505,16 @@ jobs:
           MODULE_DESCRIPTION("CRG gate + reset controller for Goke GK6323V100C");
           MODULE_LICENSE("GPL");
           CEOF
-          # 挂到 Kconfig / Makefile（用 printf 追加，避开 if 内 heredoc 缩进被 YAML 裁剪后
-          # 结束符 KEOF 无法顶格、bash 不认的问题）
+          # 挂到 Kconfig / Makefile（printf 把 \t 放在格式串里，由 printf 自己转成 Tab；
+          # 若放参数里用 '%s' 会变成字面 \t，导致 Kconfig 报 "ttristate" 语法错）
           if ! grep -q 'config COMMON_CLK_GK6323V100C' drivers/clk/hisilicon/Kconfig; then
-            printf '%s\n' \
-              'config COMMON_CLK_GK6323V100C' \
-              '\ttristate "Goke GK6323V100C CRG clock and reset driver"' \
-              '\tdepends on ARCH_HISI || COMPILE_TEST' \
-              '\tdefault ARCH_HISI' \
-              '\thelp' \
-              '\t  Clock gating and reset controller for Goke GK6323V100C SoC.' \
+            printf '%s\n' 'config COMMON_CLK_GK6323V100C' >> drivers/clk/hisilicon/Kconfig
+            printf '\t%s\n' \
+              'tristate "Goke GK6323V100C CRG clock and reset driver"' \
+              'depends on ARCH_HISI || COMPILE_TEST' \
+              'default ARCH_HISI' \
+              'help' \
+              '  Clock gating and reset controller for Goke GK6323V100C SoC.' \
               >> drivers/clk/hisilicon/Kconfig
           fi
           if ! grep -q 'crg-gk6323v100c.o' drivers/clk/hisilicon/Makefile; then
