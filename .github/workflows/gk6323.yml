@@ -291,14 +291,32 @@ jobs:
             static DEFINE_SPINLOCK(gk_crg_lock);
             static struct gk_crg_priv *gk_crg_global;
 
-            /* 🔴 关键：只保留3个必须开的时钟，其他所有位一律不写！
-             * 不写的寄存器保持U-Boot原值，eMMC/USB/网卡/I2C全部正常工作
-             */
             static const struct { u32 off; u8 bit; const char *name; } gk_gates[] = {
-                {0x388,0, "fephy",       },  /* FEPHY百兆PHY时钟：开了才能读到phy_id=0x20669906 */
-                {0x118,0, "aiao-bus",    },  /* AIAO音频总线时钟：开了才能识别ES8316声卡 */
-                {0x118,1, "aiao-mod",    },  /* AIAO音频模块时钟 */
+                /* ✅ eMMC时钟门（低bit，纯时钟，不是复位） */
+                {0xa0, 0, "emmc-bus",    },
+                {0xa0, 1, "emmc-ciu",    },
+                /* ✅ USB时钟门（0xb8/0xbc低bit全是时钟门，写1开，不是复位位！之前误删导致USB失败） */
+                {0xb8, 0, "usb2-ctrl0",  },
+                {0xb8, 1, "usb2-ctrl1",  },
+                {0xb8, 2, "usb2-ctrl2",  },
+                {0xb8, 3, "usb2-bus",    },
+                {0xb8, 4, "usb2-ahb",    },
+                {0xb8, 6, "usb2-utmi",   },
+                {0xbc, 0, "usb2-phy",    },
+                /* ✅ 网卡时钟门（0xd0低3位是时钟，bit3是复位位绝对不能碰！） */
+                {0xd0, 0, "femac-bus",   },
+                {0xd0, 1, "femac-mac",   },
+                {0xd0, 2, "femac-mdio",  },
+                /* ✅ I2C时钟门（0xd0 bit4/5/6是三路I2C时钟，不是复位位） */
+                {0xd0, 4, "i2c0-bus",    },
+                {0xd0, 5, "i2c1-bus",    },
+                {0xd0, 6, "i2c2-bus",    },
+                /* ✅ FEPHY网卡PHY时钟 + AIAO声卡时钟 */
+                {0x388,0, "fephy",       },
+                {0x118,0, "aiao-bus",    },
+                {0x118,1, "aiao-mod",    },
             };
+
 
             /* 复位表保留，但我们永远不主动触发任何复位，只给外设驱动单独查询用 */
             static const struct { u32 off; u8 bit; } gk_resets[] = {
