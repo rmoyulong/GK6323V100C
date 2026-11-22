@@ -307,11 +307,13 @@ jobs:
           	{ 0xb8,  4, "usb_hst_phy"  },    /* USB2 Host PHY 时钟 */
           	{ 0xb8,  5, "usb_utmi0"    },    /* USB2 UTMI0 */
           	{ 0xbc,  0, "usb_phy_ref"  },    /* USB2 PHY 参考时钟 */
-          	{ 0xcc,  0, "femac_bus"    },    /* FEMAC 总线 */
-          	{ 0xcc,  1, "femac_if"     },    /* FEMAC 接口时钟 */
-          	{ 0xcc,  2, "femac_core"   },    /* FEMAC 内核时钟 */
+          	{ 0xcc,  0, "eth51_0"      },    /* PERI_CRG51 保留位 */
+          	{ 0xcc,  1, "eth51_1"      },    /* PERI_CRG51 保留位 */
+          	{ 0xcc,  2, "eth51_2"      },    /* PERI_CRG51 保留位 */
+          	{ 0xd0,  0, "femac_if"     },    /* ETH 总线/接口时钟：MDIO 寄存器访问靠它 */
+          	{ 0xd0,  1, "femac_mac"    },    /* ETH MAC 内核时钟（真机实测 0xf8a220d0 = 0x3） */
+          	{ 0x388, 0, "fephy_clk"    },    /* 内置 FEPHY 时钟（真机实测 0xf8a22388 = 0x1） */
           	{ 0x118, 0, "aiao_mod"     },    /* AIAO 音频模块时钟 */
-          	{ 0x120, 0, "fephy_clk"    },    /* FEPHY 参考时钟（MII PHY ID=0x20669906） */
           };
 
           /*
@@ -329,7 +331,7 @@ jobs:
           	{ 0xb8, 16, "usb_hst_rst"  },
           	{ 0xbc,  4, "usb_phy_rst"  },
           	{ 0xbc,  8, "usb_phy0_trst"},
-          	{ 0xcc,  3, "femac_rst"    },
+          	{ 0xd0,  3, "femac_rst"    },    /* ETH MAC 软复位：清 0 = 释放 */
           	{ 0x118, 4, "aiao_rst"     },
           };
 
@@ -348,7 +350,7 @@ jobs:
            * reset 编码与海思 reset-hisilicon.c 完全一致：
            *   id = (offset << 16) | (bit << 0)  —— 由 of_xlate 从 dts 的两个 cell 编出来
            *   assert = 置位，deassert = 清位
-           * dts 里写 resets = <&cru 0xcc 3> 即 femac_rst。
+           * dts 里写 resets = <&cru 0xd0 3> 即 femac_rst。
            */
           #define HISI_RESET_OFF_SHIFT 16
           #define HISI_RESET_BIT_SHIFT 0
@@ -447,6 +449,20 @@ jobs:
           	readl_relaxed(priv->base); /* 屏障，保证写生效 */
           	spin_unlock_irqrestore(&priv->lock, flags);
           	udelay(100); /* USB/EHCI PHY PLL 锁定时间 */
+
+          	/*
+          	 * 3) 内置 FEPHY 热复位，复刻原厂 bootloader 的序列
+          	 *    （CRG 0x388：bit0 时钟、bit4 复位）：
+          	 *      时钟开 -> 断言复位 -> 延时 10us -> 释放复位 -> 延时 20ms
+          	 *    20ms 是原厂 mdelay 序列给 PHY 内部 PLL 的锁定时间；
+          	 *    真机实测释放后 0xf8a22388 稳定读到 0x1。
+          	 */
+          	val = readl_relaxed(priv->base + 0x388);
+          	writel_relaxed(val | BIT(4), priv->base + 0x388);
+          	udelay(10);
+          	writel_relaxed(val & ~BIT(4), priv->base + 0x388);
+          	readl_relaxed(priv->base + 0x388);
+          	udelay(20000);
 
           	for (i = 0; i < ARRAY_SIZE(gk_clocks); i++)
           		pos += snprintf(log + pos, sizeof(log) - pos,
