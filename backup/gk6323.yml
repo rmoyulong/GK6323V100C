@@ -225,270 +225,308 @@ jobs:
           cd linux_build
           # 该脚本自判：有 series 按 series，没有则按文件名序号应用全部 *.patch；
           # 等价于 quilt --fuzz=0，遇冲突即中止并回滚，不会静默产出缺补丁的内核
-          # ★ 300-01（为 hisilicon clk 加 PLL 支持）绝不能被删：补丁库 510-02 的
-          #   Hi3798MV200 CRG 驱动要用 hisi_clk_register_pll() 与 struct hisi_pll_clock，
-          #   删掉它 510-02 就缺符号、编译必然失败。
-          #   原先那条删除 300-01 的命令少写了上级目录（真实路径是
-          #   ../histb-patches/），rm -f 对不存在的路径静默返回成功 —— 实际一次也没删成。
-          #   这里直接删掉这条无效命令，补丁库整套照常应用。
           PATCHES_DIR="../histb-patches" CI=true bash ../apply_histb_patches.sh -y
           echo "=== 补丁后确认 ===（本仓库设备树自带，不再要求补丁库含 mv200h 板级 dts）"
           ls arch/arm64/boot/dts/hisilicon/ | head -20 || true
+
 
       - name: 部署 GK6323V100C CRG 门控与复位驱动
         run: |
           set -euo pipefail
           cd linux_build
-          # 原「sed 给 crg-hi3798mv200.c 注入 0x388 bit0」一步的锚点是该文件
-          #   probe 末尾的一句 dev_info 打印 —— 但该文件里根本没有这句、也没有
-          #   priv 变量，sed 静默空操作，FEPHY 时钟从未被打开。
-          #   而本板 dts 的外设时钟走 fixed-clock，根本不引用 mv200 CRG，
-          #   给那个驱动打补丁属于改错了文件。这里换成真正需要的驱动。
-          #
           # 为什么必须是自写驱动：dts 的 cru 节点 compatible 是 goke,gk6323v100c-crg
           #   （reg f8a22000，0x400，#reset-cells = <2>），femac 节点写着
           #   resets = <&cru 0xd0 3>。若没有驱动认领它，of_reset_control_get 取不到
           #   "mac" 复位，hisi_femac probe 直接失败 —— 现象就是 eth0 整个消失。
+          #   原版工作流里"sed 给 crg-hi3798mv200.c 注入 FEPHY 时钟"那条锚点在该文件
+          #   根本不存在（也没有 priv 变量），sed 静默空操作，FEPHY 时钟从未开。
+          #
+          # 本驱动用 platform_driver + subsys_initcall（不依赖 clk-of 私有宏）：
+          # subsys_initcall 在所有 device_initcall 外设（femac/ehci/ohci/i2c/es8316）
+          # probe 前执行，时钟门一定先开；显式开 femac/ehci/ohci/i2c/eMMC/aiao/uart
+          # 13 路时钟门（read-modify-write，不清其他位），不会按死 U-Boot 已开的模块。
+          # 本驱动用 platform_driver + subsys_initcall（不依赖 clk-of 私有宏）：
+          # subsys_initcall 在所有 device_initcall 外设（femac/ehci/ohci/i2c/es8316）
+          # probe 前执行，时钟门一定先开；显式开 femac/ehci/ohci/i2c/eMMC/aiao/uart/FEPHY
+          # 时钟门 + 主动 deassert 软复位（read-modify-write，不清其他位）。
+          # 寄存器位号取自海思 BSP hi3798mv310-clock.h 与 clk-hiusb2.c（与 GK6323V100C 同源）：
+          #   0x08 (PERI_CRG0x08 / UART0 位)        : BIT(0) 时钟
+          #   0x68 (PERI_CRG26_UART)               : UART0 复位
+          #   0x6c (PERI_CRG27_I2C)                : I2C0 clk@4 rst@5, I2C1 clk@8 rst@9, I2C2 clk@12 rst@13
+          #   0xa0 (PERI_CRG40_SDIO1 = eMMC)       : clk@0,1; rst 相关位由 U-Boot 保持
+          #   0xb8 (PERI_CRG46_USB2CTRL)           : BUS@0, OHCI48M@1, OHCI12M@2, UTMI@3, HST_PHY@4, UTMI0@5;
+          #                                         BUS_SRST@12, UTMI0_SRST@13, HST_PHY_SRST@16
+          #   0xbc (PERI_CRG47_USB2PHY)            : PHY_REF@0; PHY_SRST@4, PHY0_TREQ@8
+          #   0xcc (PERI_CRG51_GSF = FEMAC)        : FEMAC 时钟 + mac_rst@3
+          #   0x118 (PERI_CRG70_AIAO)              : AIAO clk; rst@4
+          #   0x120 (PERI_CRG72_FEPHY)             : FEPHY 参考时钟
+          #
+          # 复位语义：assert 置位、deassert 清位（与海思 reset-hisilicon.c 一致），本驱动在
+          # probe 时主动 deassert 所有下面的外设复位，让它们从 U-Boot 交棒的"未知/复位中"
+          # 状态脱离出来。femac 驱动之后会自行对 "mac"（0xd0 上的位，若该偏移不存在即空操作）
+          # 做 assert-delay-deassert 时序，由 reset_controller 处理。
           cat > drivers/clk/hisilicon/crg-gk6323v100c.c << 'CEOF'
           // SPDX-License-Identifier: GPL-2.0-only
           /*
-           * 国科微 GK6323V100C —— CRG 门控与复位控制器
+           * 国科微 GK6323V100C —— CRG 门控 + 复位控制器
            *
-           * 设计要点（针对此前多轮实测出的坑）：
-           *
-           * 1) 用 CLK_OF_DECLARE_DRIVER 做"纯 OF 早期初始化"：
-           *    platform_driver + arch_initcall_sync 在多批 initcall 里不能保证
-           *    早于 MDIO/FEMAC/USB/I²C/RTC 的 probe；这次日志里 USB -110/-75、
-           *    I²C 全 -6、RTC write error 就是"门控未开，外设已经 probe"的典型表现。
-           *    CLK_OF_DECLARE 家族由 of_clk_init() 直接调起，发生在 time_init()
-           *    之前，比所有设备驱动都早，门控一定先于外设。
-           *
-           * 2) 复位控制器 id 编码修正：
-           *    前一版用 (reg_offset << 16) | bit 编码，但 nr_resets 写成 0x400，
-           *    xlate 里 "spec->args[0] >= nr_resets" 直接把 0xd0、0x118 这种合法
-           *    偏移判为越界 → of_reset_control_get 返 -EINVAL → femac probe -5。
-           *    改为"以 (reg_offset, bit) 为键动态分配线性 id"，nr_resets 不做越界
-           *    硬编码，按 (off,bit) 查表。
-           *
-           * 3) 门控采用"OR 置位，不清零其他位"：
-           *    U-Boot 已把 eMMC/USB/I2C/串口 等门控打开，Linux 时钟框架会在 late
-           *    initcall 关掉"未被任何 clk 认领"的门控（clk_ignore_unused 只救到
-           *    注册为 clk 的那部分）。本驱动在 CLK_OF_DECLARE 早期就把这些位
-           *    再置 1（readl → OR → writel），不影响其他已开的位，确保交给外设
-           *    驱动 probe 时门控是开着的。
-           *
-           * 4) 只开时钟门、不主动 assert 复位：
-           *    之前批量写复位的版本把 U-Boot 初始化好的 eMMC 按死过一次
-           *    （dw_mmc Timeout resetting block），本版复位控制器只提供 API
-           *    给外设驱动在需要时单独 assert/deassert，probe 时一律不动。
+           * platform_driver + subsys_initcall：在所有 device_initcall 外设
+           * (femac/ehci/ohci/i2c/es8316/mmc) probe 之前执行，先开时钟门、释放复位。
+           * 寄存器位号与海思 hi3798mv310 BSP 同源，已按真机偏移重新核对。
            */
-
           #include <linux/bitops.h>
-          #include <linux/clk-provider.h>
+          #include <linux/delay.h>
+          #include <linux/err.h>
           #include <linux/gfp.h>
           #include <linux/io.h>
           #include <linux/init.h>
           #include <linux/kernel.h>
+          #include <linux/module.h>
           #include <linux/of.h>
           #include <linux/of_address.h>
+          #include <linux/platform_device.h>
           #include <linux/reset-controller.h>
           #include <linux/slab.h>
           #include <linux/spinlock.h>
           #include <linux/types.h>
 
-          /* 门控寄存器位：开时钟 = 把对应 bit 置 1。值取自原厂设备树与 Hi3798MV200 BSP。 */
-          struct gk_gate { u32 off; u32 bit; const char *name; };
+          struct gk_bit { u32 off; u32 bit; const char *name; };
 
-          static const struct gk_gate gk_always_on_gates[] __initconst = {
-          	{ 0xd0,  0, "femac_if"   },  /* PERI_CRG51 bit0: FEMAC 接口时钟     */
-          	{ 0xd0,  1, "femac_core" },  /* PERI_CRG51 bit1: FEMAC 内核时钟     */
-          	{ 0xcc,  0, "femac_bus"  },  /* PERI_CRG50 bit0: FEMAC APB 总线     */
-          	{ 0x388, 0, "fephy_clk"  },  /* PERI_PHY   bit0: FEPHY 参考时钟     */
-          	{ 0xb8,  0, "ehci_clk"   },  /* PERI_CRG46 bit0: USB EHCI 时钟      */
-          	{ 0xb8,  1, "ohci_clk"   },  /* PERI_CRG46 bit1: USB OHCI 时钟      */
-          	{ 0xbc,  0, "usb_ahb"    },  /* PERI_CRG47 bit0: USB AHB/UTMI 时钟  */
-          	{ 0x108, 0, "i2c0_clk"   },  /* PERI_CRG66 bit0: I2C0 时钟          */
-          	{ 0x108, 1, "i2c1_clk"   },  /* PERI_CRG66 bit1: I2C1 时钟          */
-          	{ 0x108, 2, "i2c2_clk"   },  /* PERI_CRG66 bit2: I2C2（ES8316/RTC） */
-          	{ 0xa0,  0, "emmc_biu"   },  /* PERI_CRG40 bit0: eMMC BIU           */
-          	{ 0xa0,  1, "emmc_ciu"   },  /* PERI_CRG40 bit1: eMMC CIU           */
-          	{ 0x118, 4, "aiao_mod"   },  /* PERI_CRG70 bit4: AIAO 模块时钟      */
-          	{ 0x98,  0, "uart0_clk"  },  /* PERI_CRG38 bit0: UART0 (ttyAMA0)    */
+          /* 时钟门：probe 时置 1 打开 */
+          static const struct gk_bit gk_clocks[] = {
+          	{ 0x08,  0, "uart0_clk"    },    /* UART0 控制台 */
+          	{ 0x6c,  4, "i2c0_clk"     },    /* I2C0 总线（ES8316 在 0x10） */
+          	{ 0x6c,  8, "i2c1_clk"     },    /* I2C1 总线 */
+          	{ 0x6c, 12, "i2c2_clk"     },    /* I2C2 总线（RTC 在 0x51） */
+          	{ 0xa0,  0, "emmc_biu"     },    /* eMMC 总线时钟 */
+          	{ 0xa0,  1, "emmc_ciu"     },    /* eMMC 卡时钟 */
+          	{ 0xb8,  0, "usb_bus"      },    /* USB2 AHB 总线 */
+          	{ 0xb8,  1, "usb_ohci48m"  },    /* USB2 OHCI 48M */
+          	{ 0xb8,  2, "usb_ohci12m"  },    /* USB2 OHCI 12M */
+          	{ 0xb8,  3, "usb_utmi"     },    /* USB2 UTMI 时钟 */
+          	{ 0xb8,  4, "usb_hst_phy"  },    /* USB2 Host PHY 时钟 */
+          	{ 0xb8,  5, "usb_utmi0"    },    /* USB2 UTMI0 */
+          	{ 0xbc,  0, "usb_phy_ref"  },    /* USB2 PHY 参考时钟 */
+          	{ 0xcc,  0, "femac_bus"    },    /* FEMAC 总线 */
+          	{ 0xcc,  1, "femac_if"     },    /* FEMAC 接口时钟 */
+          	{ 0xcc,  2, "femac_core"   },    /* FEMAC 内核时钟 */
+          	{ 0x118, 0, "aiao_mod"     },    /* AIAO 音频模块时钟 */
+          	{ 0x120, 0, "fephy_clk"    },    /* FEPHY 参考时钟（MII PHY ID=0x20669906） */
           };
 
-          struct gk_crg {
+          /*
+           * 软复位位：probe 时显式 deassert（清 0），保证外设不是被按住的状态。
+           * 写 1 = 进入复位；写 0 = 退出复位（海思惯例，与 reset-hisilicon.c assert/deassert 一致）。
+           * eMMC 相关复位位不主动动：U-Boot 已在跑数据通路，再拉一次复位会把正在
+           * 进行的 MMC 命令打断，历史上出现过 "Timeout resetting block" 就是这个。
+           */
+          static const struct gk_bit gk_resets[] = {
+          	{ 0x6c,  5, "i2c0_rst"     },
+          	{ 0x6c,  9, "i2c1_rst"     },
+          	{ 0x6c, 13, "i2c2_rst"     },
+          	{ 0xb8, 12, "usb_bus_rst"  },
+          	{ 0xb8, 13, "usb_utmi_rst" },
+          	{ 0xb8, 16, "usb_hst_rst"  },
+          	{ 0xbc,  4, "usb_phy_rst"  },
+          	{ 0xbc,  8, "usb_phy0_trst"},
+          	{ 0xcc,  3, "femac_rst"    },
+          	{ 0x118, 4, "aiao_rst"     },
+          };
+
+          struct gk_crg_priv {
           	void __iomem *base;
-          	spinlock_t lock;
+          	spinlock_t    lock;
           	struct reset_controller_dev rcdev;
-          	/* (off,bit) -> linear id 映射表：动态线性增长，不预设上限 */
-          	struct gk_rst_map { u32 off; u32 bit; } *rst_map;
-          	int rst_nr;
-          	int rst_cap;
           };
 
-          static struct gk_crg *gk_crg_singleton;
-
-          /* 给复位控制器查 (off,bit) -> id；没有就追加一条 */
-          static int gk_crg_rst_id(struct gk_crg *crg, u32 off, u32 bit, bool create)
+          static inline struct gk_crg_priv *to_gk_crg(struct reset_controller_dev *rc)
           {
-          	int i;
-          	unsigned long flags;
-          	struct gk_rst_map *m;
-
-          	spin_lock_irqsave(&crg->lock, flags);
-          	for (i = 0; i < crg->rst_nr; i++)
-          		if (crg->rst_map[i].off == off && crg->rst_map[i].bit == bit) {
-          			spin_unlock_irqrestore(&crg->lock, flags);
-          			return i;
-          		}
-          	if (!create) {
-          		spin_unlock_irqrestore(&crg->lock, flags);
-          		return -ENOENT;
-          	}
-          	if (crg->rst_nr >= crg->rst_cap) {
-          		int cap = crg->rst_cap ? crg->rst_cap * 2 : 16;
-          		m = krealloc(crg->rst_map, sizeof(*m) * cap, GFP_ATOMIC);
-          		if (!m) {
-          			spin_unlock_irqrestore(&crg->lock, flags);
-          			return -ENOMEM;
-          		}
-          		crg->rst_map = m;
-          		crg->rst_cap = cap;
-          	}
-          	crg->rst_map[crg->rst_nr].off = off;
-          	crg->rst_map[crg->rst_nr].bit = bit;
-          	i = crg->rst_nr++;
-          	crg->rcdev.nr_resets = crg->rst_nr;
-          	spin_unlock_irqrestore(&crg->lock, flags);
-          	return i;
+          	return container_of(rc, struct gk_crg_priv, rcdev);
           }
 
-          static int gk_crg_reset_xlate(struct reset_controller_dev *rcdev,
-          			      const struct of_phandle_args *spec)
+          /*
+           * reset 编码与海思 reset-hisilicon.c 完全一致：
+           *   id = (offset << 16) | (bit << 0)  —— 由 of_xlate 从 dts 的两个 cell 编出来
+           *   assert = 置位，deassert = 清位
+           * dts 里写 resets = <&cru 0xcc 3> 即 femac_rst。
+           */
+          #define HISI_RESET_OFF_SHIFT 16
+          #define HISI_RESET_BIT_SHIFT 0
+          static int gk_reset_of_xlate(struct reset_controller_dev *rcdev,
+          		       const struct of_phandle_args *rs)
           {
-          	struct gk_crg *crg = container_of(rcdev, struct gk_crg, rcdev);
-          	if (spec->args_count != 2)
+          	u32 off, bit;
+          	if (WARN_ON(rs->args_count != 2))
           		return -EINVAL;
-          	/* 允许设备树里直接给 (offset, bit)：offset < 0x10000 视为寄存器偏移 */
-          	return gk_crg_rst_id(crg, spec->args[0], spec->args[1], true);
+          	off = rs->args[0] & 0xfff;
+          	bit = rs->args[1] & 0x1f;
+          	return (off << HISI_RESET_OFF_SHIFT) | (bit << HISI_RESET_BIT_SHIFT);
           }
 
-          static int gk_crg_reset_assert(struct reset_controller_dev *rcdev,
-          			       unsigned long id)
+          static int gk_reset_assert(struct reset_controller_dev *rc, unsigned long id)
           {
-          	struct gk_crg *crg = container_of(rcdev, struct gk_crg, rcdev);
+          	struct gk_crg_priv *priv = to_gk_crg(rc);
+          	u32 off = (id >> HISI_RESET_OFF_SHIFT) & 0xfff;
+          	u32 bit = (id >> HISI_RESET_BIT_SHIFT) & 0x1f;
           	unsigned long flags;
-          	u32 v;
-          	if (id >= crg->rst_nr) return -ENOENT;
-          	spin_lock_irqsave(&crg->lock, flags);
-          	v = readl(crg->base + crg->rst_map[id].off);
-          	writel(v | BIT(crg->rst_map[id].bit), crg->base + crg->rst_map[id].off);
-          	spin_unlock_irqrestore(&crg->lock, flags);
+          	u32 val;
+          	spin_lock_irqsave(&priv->lock, flags);
+          	val = readl_relaxed(priv->base + off);
+          	writel_relaxed(val | BIT(bit), priv->base + off);
+          	spin_unlock_irqrestore(&priv->lock, flags);
           	return 0;
           }
 
-          static int gk_crg_reset_deassert(struct reset_controller_dev *rcdev,
-          				 unsigned long id)
+          static int gk_reset_deassert(struct reset_controller_dev *rc, unsigned long id)
           {
-          	struct gk_crg *crg = container_of(rcdev, struct gk_crg, rcdev);
+          	struct gk_crg_priv *priv = to_gk_crg(rc);
+          	u32 off = (id >> HISI_RESET_OFF_SHIFT) & 0xfff;
+          	u32 bit = (id >> HISI_RESET_BIT_SHIFT) & 0x1f;
           	unsigned long flags;
-          	u32 v;
-          	if (id >= crg->rst_nr) return -ENOENT;
-          	spin_lock_irqsave(&crg->lock, flags);
-          	v = readl(crg->base + crg->rst_map[id].off);
-          	writel(v & ~BIT(crg->rst_map[id].bit), crg->base + crg->rst_map[id].off);
-          	spin_unlock_irqrestore(&crg->lock, flags);
+          	u32 val;
+          	spin_lock_irqsave(&priv->lock, flags);
+          	val = readl_relaxed(priv->base + off);
+          	writel_relaxed(val & ~BIT(bit), priv->base + off);
+          	readl_relaxed(priv->base + off); /* 屏障 */
+          	spin_unlock_irqrestore(&priv->lock, flags);
           	return 0;
           }
 
-          static int gk_crg_reset_status(struct reset_controller_dev *rcdev,
-          				unsigned long id)
+          static int gk_reset_status(struct reset_controller_dev *rc, unsigned long id)
           {
-          	struct gk_crg *crg = container_of(rcdev, struct gk_crg, rcdev);
-          	if (id >= crg->rst_nr) return -ENOENT;
-          	return !!(readl(crg->base + crg->rst_map[id].off) & BIT(crg->rst_map[id].bit));
+          	struct gk_crg_priv *priv = to_gk_crg(rc);
+          	u32 off = (id >> HISI_RESET_OFF_SHIFT) & 0xfff;
+          	u32 bit = (id >> HISI_RESET_BIT_SHIFT) & 0x1f;
+          	return !!(readl_relaxed(priv->base + off) & BIT(bit));
           }
 
-          static const struct reset_control_ops gk_crg_reset_ops = {
-          	.assert   = gk_crg_reset_assert,
-          	.deassert = gk_crg_reset_deassert,
-          	.status   = gk_crg_reset_status,
+          static const struct reset_control_ops gk_reset_ops = {
+          	.assert   = gk_reset_assert,
+          	.deassert = gk_reset_deassert,
+          	.status   = gk_reset_status,
           };
 
-          static void __init gk_crg_setup(void __iomem *base, struct device_node *np)
+          static int gk_crg_probe(struct platform_device *pdev)
           {
-          	struct gk_crg *crg;
-          	int i, n = ARRAY_SIZE(gk_always_on_gates);
-          	u32 v;
-          	static char gate_log[256];
-          	int pos = 0;
+          	struct device *dev = &pdev->dev;
+          	struct device_node *np = dev->of_node;
+          	struct gk_crg_priv *priv;
+          	char log[384] = "";
+          	int pos = 0, i, ret;
+          	unsigned long flags;
+          	u32 val;
 
-          	/* 把门控全部 OR 置 1；不清零任何位，避免误伤 U-Boot 已开好的门 */
-          	for (i = 0; i < n; i++) {
-          		v = readl(base + gk_always_on_gates[i].off);
-          		writel(v | BIT(gk_always_on_gates[i].bit),
-          		       base + gk_always_on_gates[i].off);
-          		pos += scnprintf(gate_log + pos, sizeof(gate_log) - pos,
-          				 "%s%s", i ? "," : "", gk_always_on_gates[i].name);
-          	}
-
-          	crg = kzalloc(sizeof(*crg), GFP_KERNEL);
-          	if (WARN_ON(!crg)) return;
-          	crg->base = base;
-          	spin_lock_init(&crg->lock);
-          	crg->rst_map = NULL;
-          	crg->rst_nr = 0;
-          	crg->rst_cap = 0;
-
-          	crg->rcdev.ops = &gk_crg_reset_ops;
-          	crg->rcdev.owner = NULL;
-          	crg->rcdev.nr_resets = 0;
-          	crg->rcdev.of_node = np;
-          	crg->rcdev.of_reset_n_cells = 2;
-          	crg->rcdev.of_xlate = gk_crg_reset_xlate;
-
-          	if (reset_controller_register(&crg->rcdev)) {
-          		pr_err("gk6323v100c-crg: reset_controller_register failed\n");
-          		kfree(crg);
-          		return;
-          	}
-          	gk_crg_singleton = crg;
-
-          	pr_info("gk6323v100c-crg f8a22000: gates on [%s], reset cells=2\n", gate_log);
-          }
-
-          static int __init gk_crg_of_init(struct device_node *np)
-          {
-          	void __iomem *base;
-          	base = of_iomap(np, 0);
-          	if (!base) {
-          		pr_err("gk6323v100c-crg: of_iomap failed\n");
+          	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+          	if (!priv)
+          		return -ENOMEM;
+          	priv->base = devm_of_iomap(dev, np, 0, NULL);
+          	if (IS_ERR_OR_NULL(priv->base)) {
+          		dev_err(dev, "gk6323v100c-crg: iomap failed\n");
           		return -ENXIO;
           	}
-          	gk_crg_setup(base, np);
-          	/* CLK_OF_DECLARE 在 of_clk_init() 阶段一次性完成时钟门控 + 复位控制器
-          	 * 注册，不遗留 platform_driver 二次 probe，避免 probe 顺序依赖。 */
+          	spin_lock_init(&priv->lock);
+          	platform_set_drvdata(pdev, priv);
+
+          	/* 1) 先开时钟门 */
+          	spin_lock_irqsave(&priv->lock, flags);
+          	for (i = 0; i < ARRAY_SIZE(gk_clocks); i++) {
+          		const struct gk_bit *g = &gk_clocks[i];
+          		val = readl_relaxed(priv->base + g->off);
+          		writel_relaxed(val | BIT(g->bit), priv->base + g->off);
+          	}
+          	spin_unlock_irqrestore(&priv->lock, flags);
+
+          	/* 2) 再 deassert 软复位：USB PHY 复位需时钟稳定后延时 */
+          	udelay(20);
+          	spin_lock_irqsave(&priv->lock, flags);
+          	for (i = 0; i < ARRAY_SIZE(gk_resets); i++) {
+          		const struct gk_bit *g = &gk_resets[i];
+          		val = readl_relaxed(priv->base + g->off);
+          		writel_relaxed(val & ~BIT(g->bit), priv->base + g->off);
+          	}
+          	readl_relaxed(priv->base); /* 屏障，保证写生效 */
+          	spin_unlock_irqrestore(&priv->lock, flags);
+          	udelay(100); /* USB/EHCI PHY PLL 锁定时间 */
+
+          	for (i = 0; i < ARRAY_SIZE(gk_clocks); i++)
+          		pos += snprintf(log + pos, sizeof(log) - pos,
+          				"%s%s", i ? "," : "", gk_clocks[i].name);
+          	pr_info("gk6323v100c-crg f8a22000: clk [%s]\n", log);
+
+          	pos = 0;
+          	for (i = 0; i < ARRAY_SIZE(gk_resets); i++)
+          		pos += snprintf(log + pos, sizeof(log) - pos,
+          				"%s%s", i ? "," : "", gk_resets[i].name);
+          	pr_info("gk6323v100c-crg f8a22000: rst released [%s]\n", log);
+
+          	priv->rcdev.owner           = THIS_MODULE;
+          	priv->rcdev.ops             = &gk_reset_ops;
+          	priv->rcdev.of_node         = np;
+          	priv->rcdev.nr_resets       = 0xfff * 32;
+          	priv->rcdev.of_reset_n_cells = 2;
+          	priv->rcdev.of_xlate        = gk_reset_of_xlate;
+          	ret = devm_reset_controller_register(dev, &priv->rcdev);
+          	if (ret) {
+          		dev_err(dev, "gk6323v100c-crg: reset_controller_register failed %d\n", ret);
+          		return ret;
+          	}
           	return 0;
           }
 
-          CLK_OF_DECLARE(gk6323v100c_crg, "goke,gk6323v100c-crg", gk_crg_of_init);
-          CLK_OF_DECLARE(gk6323v100c_cru, "goke,gk6323v100c-cru", gk_crg_of_init);
+          static const struct of_device_id gk_crg_of_match[] = {
+          	{ .compatible = "goke,gk6323v100c-crg" },
+          	{ .compatible = "goke,gk6323v100c-cru" },
+          	{ /* sentinel */ }
+          };
+          MODULE_DEVICE_TABLE(of, gk_crg_of_match);
 
+          static struct platform_driver gk_crg_driver = {
+          	.probe = gk_crg_probe,
+          	.driver = {
+          		.name           = "gk6323v100c-crg",
+          		.of_match_table = gk_crg_of_match,
+          	},
+          };
+
+          /* subsys_initcall：在 device_initcall 外设 probe 前执行 */
+          static int __init gk_crg_init(void)
+          {
+          	return platform_driver_register(&gk_crg_driver);
+          }
+          subsys_initcall(gk_crg_init);
+
+          static void __exit gk_crg_exit(void)
+          {
+          	platform_driver_unregister(&gk_crg_driver);
+          }
+          module_exit(gk_crg_exit);
+
+          MODULE_AUTHOR("GK6323V100C mainline port");
+          MODULE_DESCRIPTION("CRG gate + reset controller for Goke GK6323V100C");
+          MODULE_LICENSE("GPL");
           CEOF
-          # Kconfig 追加本驱动符号（带幂等哨兵，重复跑只写一次）
-          if ! grep -q '^config COMMON_CLK_GK6323V100C' drivers/clk/hisilicon/Kconfig; then
-            printf '\nconfig COMMON_CLK_GK6323V100C\n\tbool "GK6323V100C CRG gate and reset controller"\n\tdepends on OF\n\tdefault y\n' >> drivers/clk/hisilicon/Kconfig
+          # 挂到 Kconfig / Makefile
+          if ! grep -q 'config COMMON_CLK_GK6323V100C' drivers/clk/hisilicon/Kconfig; then
+            cat >> drivers/clk/hisilicon/Kconfig << 'KEOF'
+            config COMMON_CLK_GK6323V100C
+            	tristate "Goke GK6323V100C CRG clock and reset driver"
+            	depends on ARCH_HISI || COMPILE_TEST
+            	default ARCH_HISI
+            	help
+            	  Clock gating and reset controller for Goke GK6323V100C SoC.
+            KEOF
           fi
-          # Makefile 追加目标（用 printf 而非 echo：echo 不解释 \t，会写出字面反斜杠-t）
           if ! grep -q 'crg-gk6323v100c.o' drivers/clk/hisilicon/Makefile; then
             printf 'obj-$(CONFIG_COMMON_CLK_GK6323V100C)\t+= crg-gk6323v100c.o\n' >> drivers/clk/hisilicon/Makefile
           fi
-          echo "=== 驱动部署结果 ==="
+          # 三层校验
           test -s drivers/clk/hisilicon/crg-gk6323v100c.c
+          grep -q 'config COMMON_CLK_GK6323V100C' drivers/clk/hisilicon/Kconfig
           grep -q 'crg-gk6323v100c.o' drivers/clk/hisilicon/Makefile
-          grep -q '^config COMMON_CLK_GK6323V100C' drivers/clk/hisilicon/Kconfig
+          echo "=== CRG 驱动已部署 ==="
           wc -l drivers/clk/hisilicon/crg-gk6323v100c.c
           grep -n 'COMMON_CLK_GK6323V100C' drivers/clk/hisilicon/Kconfig drivers/clk/hisilicon/Makefile
+
 
       - name: 应用 GK6323 DTB 兜底启动补丁（照搬 Hi3798MV320 逻辑）
         run: |
@@ -618,17 +656,14 @@ jobs:
           # 只是防止叠加过程中丢项，符号名以内核 Kconfig 为准
           scripts/config --enable ARCH_HISI
           scripts/config --enable OF
-          # 时钟 / 复位：国科私有 CRU（gk6323 那一套）主线里没有驱动，本板
-          # dts 的外设时钟目前仍指向 fixed-clock 节点（见 dts 头部注释第 2 条）。
-          # 补丁库的 COMMON_CLK_HI3798MV200（510-02 / 410-02）提供 Hi3798MV200
-          # 的 CRG（时钟+复位）驱动 —— 这是把外设时钟门控真正打开的正路，符号名
-          # 已在补丁库里逐字核对；这里打开它，等设备树接上 CRG 节点后即可 bind。
-          # ★ 历史教训：曾在此处误加 COMMON_CLK_HI3516CV300 / CLK_GK6323V100C /
-          #   RESET_GK6323，这三个符号在本内核树里根本不存在 —— 构建会被自己的
-          #   「必须项」校验挡下（日志停在 CONFIG_CLK_GK6323V100C 未开启）。
+          # 时钟 / 复位：本工作流在前面「部署 GK6323V100C CRG 驱动」步骤里自写
+          # 了 crg-gk6323v100c.c（platform_driver + subsys_initcall，显式开
+          # femac/ehci/ohci/i2c/eMMC/aiao/uart 13 路时钟门），Kconfig 符号是
+          # COMMON_CLK_GK6323V100C；这里启用它，并禁用 Hi3798MV200 CRG 以避免
+          # 冲突。
           scripts/config --enable COMMON_CLK
-          scripts/config --enable COMMON_CLK_HI3798MV200
           scripts/config --enable COMMON_CLK_GK6323V100C
+          scripts/config --disable COMMON_CLK_HI3798MV200   # 我们有自写 CRG，避免冲突
           scripts/config --enable RESET_CONTROLLER
           scripts/config --enable RESET_HISI
           # 中断控制器 / 定时器（真机是 GICv3 + A55，不是 GIC-400 + A53）
@@ -790,7 +825,7 @@ jobs:
           echo "=== 期望项：没生效只告警（可能依赖未满足或被改名）==="
           for s in OF SERIAL_AMBA_PL011 \
                    MMC MMC_DW MMC_DW_PLTFM MMC_DW_HI3798CV200 \
-                   COMMON_CLK_HI3798MV200 \
+                   COMMON_CLK_GK6323V100C \
                    OF_MDIO MDIO_HISI_FEMAC \
                    GENERIC_PHY USB_PHY \
                    USB_EHCI_HCD_PLATFORM USB_OHCI_HCD USB_OHCI_HCD_PLATFORM USB_STORAGE \
