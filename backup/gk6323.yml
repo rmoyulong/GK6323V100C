@@ -741,6 +741,10 @@ jobs:
           # olddefconfig 之后执行，这里显式打开；IPV6 是带 prompt 的 bool、
           # 依赖 NET/INET 均满足，后面那次 olddefconfig 不会把它重算掉。
           scripts/config --enable IPV6
+          #关掉 CIFS 的 NTLM 哈希加速
+          #主线 7.4 上 cifs 的 cifs_md4 模块是专门为 NTLMv2 认证加速的内联哈希，和 7.4-rc3 新引入的 crypto 异步改动有竞态，扫描时频繁分配/释放 mids 就会触发 use-after-free。在你的 slim.config（或工作流 scripts/config 段）里关掉它即可
+          scripts/config --disable CIFS_MD4
+          scripts/config --disable CIFS_UPCALL       # 也顺手关掉，避免走 keyctl 异步
           # HISI_FESTA_PHY：补丁库 rc3 起整库已无此符号，写在这里只会往 .config
           # 里塞一行无主键、随后被 olddefconfig 丢掉。已删除，改由「已移除符号
           # 报告」一节持续盯它 —— 驱动一旦回到补丁库就能立刻看到。
