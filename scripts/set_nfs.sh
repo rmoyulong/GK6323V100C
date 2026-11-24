@@ -14,3 +14,7 @@ cat > /etc/exports <<EOF
 EOF
 
 exportfs -ra && systemctl restart nfs-server
+
+
+echo "NFS 服务端需放行端口：‌111（portmap）、2049（nfs）、20048（mountd）‌，TCP+UDP。你板子在 192.168.1.x 网段，刚好匹配 192.168.1.0/24"
+echo "导出规则；跨网段时请确认中间是路由而非 NAT（NAT 下 NFSv3 mountd 反向回连易挂）。"
