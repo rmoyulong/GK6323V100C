@@ -47,7 +47,7 @@ on:
   push:
     branches: [ master, main ]
     paths:
-      - '.github/workflows/gk6323.yml'
+      - '.github/workflows/gk6323-2G.yml'
       - 'kernel.config'
       - 'slim.config'
       - 'apply_histb_patches.sh'
