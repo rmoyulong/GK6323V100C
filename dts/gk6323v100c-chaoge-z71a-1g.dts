@@ -54,14 +54,14 @@
 	};
 
 	/*
-	 * 内存：2GiB，取自真机导出的设备树，与真机 /proc/meminfo 的
-	 * MemTotal: 2018984 kB 吻合。
+	 * 内存：1GiB，取自真机导出的设备树，与真机 /proc/meminfo 的
+	 * MemTotal: 2018984/2 kB 吻合。
 	 * ★ 不要被 U-Boot 的 "DRAM: 1 GiB" 误导：那是 U-Boot 自己的可映射上限，
 	 *   不代表硬件容量。写成 1GiB 会让内核白白少认一半内存。
 	 */
 	memory@0 {
 		device_type = "memory";
-		reg = <0x00 0x00 0x00 0x80000000>;
+		reg = <0x00 0x00 0x00 0x40000000>;
 	};
 
 	/* BL31(ATF) 与 OPTEE 占用区，必须告知内核，否则会被当作可用内存 */
